@@ -1,0 +1,223 @@
+use anyhow::{anyhow, Context};
+use once_cell::sync::OnceCell;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::{
+    env::{self, VarError},
+    fs::{OpenOptions, File},
+    io::{Read, Write},
+    sync::atomic::{AtomicU32, Ordering}, path::Path,
+};
+use time::UtcOffset;
+use std::fs;
+
+static GLOBAL_CONFIG: OnceCell<Config> = OnceCell::new();
+
+const ALPACA_KEY_ID_ENV_VAR: &str = "ALPACA_KEY_ID";
+const ALPACA_SECRET_KEY_ENV_VAR: &str = "ALPACA_SECRET_KEY";
+const FORCE_OPEN_ENV_VAR: &str = "FORCE_OPEN";
+const CONFIG_PATH: &str = "./config.json";
+
+pub struct Config {
+    pub keys: ApiKeys,
+    pub urls: Urls,
+    pub trading: TradingConfig,
+    pub utc_offset: LocalOffset,
+    pub force_open: bool,
+}
+
+impl Config {
+    pub fn get() -> &'static Self {
+        GLOBAL_CONFIG.get().expect("Config not set")
+    }
+
+    pub fn init() -> anyhow::Result<()> {
+        let keys = ApiKeys::from_env()?;
+
+        let config_path = Path::new(CONFIG_PATH);
+
+        let on_disk_config = if config_path.exists() {
+            let mut config_file = OpenOptions::new()
+                .read(true)
+                .write(false)
+                .open(config_path)
+                .context("Failed to open config file")?;
+
+            let mut buf = String::with_capacity(usize::try_from(config_file.metadata()?.len())?);
+            config_file.read_to_string(&mut buf).context("Failed to read config file")?;
+
+            match serde_json::from_str::<OnDiskConfig>(&buf) {
+                Ok(config) => config,
+                Err(error) => {
+                    println!("Failed to read on-disk config ({error}), writing default config.");
+                    let (default, buf) = OnDiskConfig::default_serialized();
+                    drop(config_file);
+                    fs::write(config_path, buf.as_bytes()).context("Failed to write default config")?;
+                    default
+                }
+            }
+        } else {
+            let mut config_file = File::create(config_path).context("Failed to create config file")?;
+            let (default, buf) = OnDiskConfig::default_serialized();
+            config_file.write_all(buf.as_bytes()).context("Failed to write default config")?;
+            default
+        };
+
+        let utc_offset = match UtcOffset::current_local_offset() {
+            Ok(offset) => LocalOffset::new(offset),
+            Err(_) => on_disk_config
+                .utc_offset
+                .unwrap_or_else(|| LocalOffset::new(UtcOffset::UTC)),
+        };
+
+        let force_open = match read_opt_env_var(FORCE_OPEN_ENV_VAR)? {
+            Some(var) => match var.parse() {
+                Ok(val) => val,
+                Err(_) => {
+                    return Err(anyhow!(
+                        "Invalid value for env var {FORCE_OPEN_ENV_VAR}: {var}"
+                    ))
+                }
+            },
+            None => false,
+        };
+
+        let me = Self {
+            keys,
+            urls: on_disk_config.urls,
+            trading: on_disk_config.trading,
+            utc_offset,
+            force_open,
+        };
+
+        GLOBAL_CONFIG
+            .set(me)
+            .map_err(|_| anyhow!("Config already initialized"))
+    }
+}
+
+pub struct ApiKeys {
+    pub alpaca_key_id: String,
+    pub alpaca_secret_key: String,
+}
+
+impl ApiKeys {
+    fn from_env() -> anyhow::Result<Self> {
+        let alpaca_key_id = read_env_var(ALPACA_KEY_ID_ENV_VAR)?;
+        let alpaca_secret_key = read_env_var(ALPACA_SECRET_KEY_ENV_VAR)?;
+
+        Ok(Self {
+            alpaca_key_id,
+            alpaca_secret_key,
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct Urls {
+    pub alpaca_api_base: String,
+    pub alpaca_data_api: String,
+    pub alpaca_stream_url: String,
+}
+
+impl Default for Urls {
+    fn default() -> Self {
+        Self {
+            alpaca_api_base: "https://api.alpaca.markets/v2".to_owned(),
+            alpaca_data_api: "https://data.alpaca.markets/v2".to_owned(),
+            alpaca_stream_url: "wss://stream.data.alpaca.markets/v2".to_owned(),
+        }
+    }
+}
+
+fn read_env_var(env_var: &str) -> anyhow::Result<String> {
+    read_opt_env_var(env_var)?.ok_or_else(|| anyhow!("Missing required env var {env_var}"))
+}
+
+fn read_opt_env_var(env_var: &str) -> anyhow::Result<Option<String>> {
+    match env::var(env_var) {
+        Ok(var) => Ok(Some(var)),
+        Err(VarError::NotPresent) => Ok(None),
+        Err(error @ VarError::NotUnicode(_)) => {
+            Err(anyhow!("Failed to parse env var {env_var}: {error}"))
+        }
+    }
+}
+
+pub struct LocalOffset {
+    atomic_offset: AtomicU32,
+}
+
+impl LocalOffset {
+    fn offset_to_u32(offset: UtcOffset) -> u32 {
+        let (h, m, s) = offset.as_hms();
+        let bytes = [h as u8, m as u8, s as u8, 0];
+        u32::from_ne_bytes(bytes)
+    }
+
+    fn new(offset: UtcOffset) -> Self {
+        Self {
+            atomic_offset: AtomicU32::new(Self::offset_to_u32(offset)),
+        }
+    }
+
+    pub fn get(&self) -> UtcOffset {
+        let [h, m, s, _] = self.atomic_offset.load(Ordering::Relaxed).to_ne_bytes();
+        UtcOffset::from_hms(h as i8, m as i8, s as i8)
+            .expect("LocalOffset internal invariant violated")
+    }
+
+    pub fn set(&self, offset: UtcOffset) {
+        self.atomic_offset
+            .store(Self::offset_to_u32(offset), Ordering::Relaxed);
+    }
+}
+
+impl Serialize for LocalOffset {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        self.get().serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for LocalOffset {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        UtcOffset::deserialize(deserializer).map(Self::new)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct TradingConfig {
+    pub pre_open_hours_offset: u8,
+    pub seconds_per_tick: u64,
+}
+
+impl Default for TradingConfig {
+    fn default() -> Self {
+        TradingConfig {
+            pre_open_hours_offset: 3,
+            seconds_per_tick: 10,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct OnDiskConfig {
+    urls: Urls,
+    trading: TradingConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    utc_offset: Option<LocalOffset>,
+}
+
+impl OnDiskConfig {
+    fn default_serialized() -> (Self, String) {
+        let default = Self::default();
+        let serialized = serde_json::to_string_pretty(&default).expect("Failed to serialize on-disk config");
+
+        (default, serialized)
+    }
+}
