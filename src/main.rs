@@ -1,6 +1,8 @@
 mod config;
 mod engine;
+mod entity;
 mod event;
+mod history;
 mod logging;
 mod rest;
 mod util;
@@ -17,7 +19,7 @@ use tokio::{runtime::Builder, task};
 
 fn main() {
     if let Err(error) = setup_and_launch() {
-        println!("{error}");
+        println!("{error:?}");
     }
 }
 
@@ -47,7 +49,7 @@ fn setup_and_launch() -> Result<(), anyhow::Error> {
         // Success
         Ok(Ok(())) => (),
         // Regular error which was bubbled up to us
-        Ok(Err(error)) => error!("Caught error: {error}"),
+        Ok(Err(error)) => error!("Caught error: {error:?}"),
         // We caught a panic
         Err(panic) => {
             let message = panic
@@ -76,10 +78,10 @@ async fn launch(editor: Editor<()>) -> anyhow::Result<()> {
     let command_task = task::spawn(command::run_task(events.new_emitter::<Command>(), editor));
     task::spawn(clock::run_task(
         events.new_emitter::<ClockEvent>(),
-        rest_api,
+        rest_api.clone(),
     ));
 
-    engine::run(events).await;
+    engine::run(events, rest_api).await;
 
     command_task.await.unwrap();
     Ok(())

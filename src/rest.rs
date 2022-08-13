@@ -1,12 +1,23 @@
+use std::collections::hash_map::Entry;
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::time::Instant;
+
 use crate::config::Config;
+use crate::entity::trading::*;
 use anyhow::anyhow;
 use anyhow::Context;
 use reqwest::{Client, Method, RequestBuilder};
-use rust_decimal::Decimal;
-use serde::{de::DeserializeOwned, Deserialize};
-use time::serde::rfc3339;
+use serde::de::DeserializeOwned;
+use serde::Deserialize;
+use serde::Deserializer;
+use std::time::Duration as StdDuration;
+use stock_symbol::Symbol;
+use time::format_description::well_known::Rfc3339;
+use time::Date;
+use time::Duration;
 use time::OffsetDateTime;
-use uuid::Uuid;
+use tokio::time::sleep;
 
 const KEY_ID_HEADER: &str = "APCA-API-KEY-ID";
 const SECRET_KEY_HEADER: &str = "APCA-API-SECRET-KEY";
@@ -49,11 +60,22 @@ impl AlpacaRestApi {
             .header(SECRET_KEY_HEADER, &self.config.keys.alpaca_secret_key)
     }
 
+    fn data_endpoint(&self, endpoint: &str) -> RequestBuilder {
+        self.client
+            .get(format!("{}{endpoint}", self.config.urls.alpaca_data_api))
+            .header(KEY_ID_HEADER, &self.config.keys.alpaca_key_id)
+            .header(SECRET_KEY_HEADER, &self.config.keys.alpaca_secret_key)
+    }
+
     async fn send<T: DeserializeOwned>(request: RequestBuilder) -> anyhow::Result<T> {
         let text = request.send().await?.text().await?;
-        serde_json::from_str(&text)
+        let res = serde_json::from_str(&text)
             .context("Failed to parse response")
-            .map_err(Into::into)
+            .map_err(Into::into);
+        if res.is_err() {
+            log::debug!("{text}");
+        }
+        res
     }
 
     pub async fn account(&self) -> anyhow::Result<Account> {
@@ -63,58 +85,142 @@ impl AlpacaRestApi {
     pub async fn clock(&self) -> anyhow::Result<Clock> {
         Self::send(self.trading_endpoint(Method::GET, "/clock")).await
     }
+
+    pub async fn us_equities(&self) -> anyhow::Result<Vec<Equity>> {
+        Self::send(
+            self.trading_endpoint(Method::GET, "/assets")
+                .query(&[
+                    ("status", "active"),
+                    ("asset_class", "us_equity"),
+                ])
+        )
+        .await
+    }
+
+    pub async fn day_bar<B: DeserializeOwned>(
+        &self,
+        stock: Symbol,
+        date: OffsetDateTime,
+    ) -> Result<Option<B>, anyhow::Error> {
+        let start_date = date.format(&Rfc3339)?;
+        let end_date = (date + Duration::days(1)).format(&Rfc3339)?;
+        let mut response = Self::send::<AlpacaBarsResponse<B>>(
+            self.data_endpoint(&format!("/stocks/{}/bars", stock))
+                .query(&[
+                    ("start", start_date.as_str()),
+                    ("end", &end_date),
+                    ("limit", "1"),
+                    ("timeframe", "1Day"),
+                ]),
+        )
+        .await?;
+
+        match response.bars.len() {
+            0 => Ok(None),
+            1 => {
+                let bar = response.bars.remove(0);
+                Ok(Some(bar))
+            }
+            _ => Err(anyhow!(
+                "Received more than one bar for {} on {}",
+                stock,
+                date
+            )),
+        }
+    }
+
+    pub async fn history<B: DeserializeOwned>(
+        &self,
+        mut symbols: impl Iterator<Item = Symbol>,
+        start: OffsetDateTime,
+        end: Option<OffsetDateTime>,
+    ) -> anyhow::Result<HashMap<Symbol, Vec<B>>> {
+        let first = match symbols.next() {
+            Some(symbol) => symbol,
+            None => return Ok(HashMap::new()),
+        };
+
+        let symbols_string = symbols.fold(first.as_str().to_owned(), |mut string, symbol| {
+            string.push(',');
+            string.push_str(&symbol);
+            string
+        });
+
+        let start_date = start.format(&Rfc3339)?;
+        let end_date = end.map(|end| end.format(&Rfc3339)).transpose()?;
+
+        let mut agg_history = HashMap::<Symbol, Vec<B>>::new();
+        let mut next_page_token = None;
+
+        loop {
+            let request = self.data_endpoint("/stocks/bars").query(&[
+                ("symbols", &*symbols_string),
+                ("timeframe", "1Day"),
+                ("limit", "10000"),
+                ("start", &*start_date),
+            ]);
+
+            let request = if let Some(end) = &end_date {
+                request.query(&[("end", end)])
+            } else {
+                request
+            };
+
+            let request = if let Some(page_token) = &next_page_token {
+                request.query(&[("page_token", page_token)])
+            } else {
+                request
+            };
+
+            let request_sent_at = Instant::now();
+            let response: History<B> = Self::send(request).await?;
+
+            for (symbol, bars) in response.bars {
+                match agg_history.entry(symbol) {
+                    Entry::Occupied(mut entry) => entry.get_mut().extend(bars),
+                    Entry::Vacant(entry) => {
+                        entry.insert(bars);
+                    }
+                }
+            }
+
+            next_page_token = response.next_page_token;
+            if next_page_token.is_none() {
+                break;
+            } else {
+                let elapsed = request_sent_at.elapsed();
+                sleep(StdDuration::from_millis(400).saturating_sub(elapsed)).await;
+            }
+        }
+
+        Ok(agg_history)
+    }
 }
 
 #[derive(Deserialize)]
-pub struct Account {
-    pub id: Uuid,
-    pub account_number: String,
-    pub status: AccountStatus,
-    pub currency: String,
-    pub cash: Decimal,
-    pub portfolio_value: Decimal,
-    pub pattern_day_trader: bool,
-    pub trade_suspended_by_user: bool,
-    pub trading_blocked: bool,
-    pub transfers_blocked: bool,
-    pub account_blocked: bool,
-    #[serde(with = "rfc3339")]
-    pub created_at: OffsetDateTime,
-    pub shorting_enabled: bool,
-    pub long_market_value: Decimal,
-    pub short_market_value: Decimal,
-    pub equity: Decimal,
-    pub last_equity: Decimal,
-    pub multiplier: Decimal,
-    pub buying_power: Decimal,
-    pub initial_margin: Decimal,
-    pub maintenance_margin: Decimal,
-    pub sma: Decimal,
-    pub daytrade_count: u32,
-    pub last_maintenance_margin: Decimal,
-    pub daytrading_buying_power: Decimal,
-    pub regt_buying_power: Decimal,
+struct History<B> {
+    bars: HashMap<Symbol, Vec<B>>,
+    next_page_token: Option<String>,
 }
 
-#[derive(Deserialize, PartialEq, Eq, Debug)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum AccountStatus {
-    Onboarding,
-    SubmissionFailed,
-    Submitted,
-    AccountUpdated,
-    ApprovalPending,
-    Active,
-    Rejected,
+#[derive(Deserialize)]
+struct AlpacaBarsResponse<B: DeserializeOwned> {
+    #[serde(
+        deserialize_with = "AlpacaBarsResponse::deserialize_bars",
+        default = "Vec::new"
+    )]
+    pub bars: Vec<B>,
+    pub symbol: Symbol,
+    #[serde(default)]
+    pub next_page_token: Option<String>,
 }
 
-#[derive(Deserialize, Clone, Copy, Debug)]
-pub struct Clock {
-    #[serde(with = "rfc3339")]
-    pub timestamp: OffsetDateTime,
-    pub is_open: bool,
-    #[serde(with = "rfc3339")]
-    pub next_open: OffsetDateTime,
-    #[serde(with = "rfc3339")]
-    pub next_close: OffsetDateTime,
+impl<B: DeserializeOwned> AlpacaBarsResponse<B> {
+    fn deserialize_bars<'de, D>(deserializer: D) -> Result<Vec<B>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let opt_bars: Option<Vec<B>> = Deserialize::deserialize(deserializer)?;
+        Ok(opt_bars.unwrap_or_default())
+    }
 }

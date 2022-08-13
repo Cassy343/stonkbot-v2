@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{num::NonZeroUsize, time::Duration};
 
 use crate::{
     config::Config,
@@ -7,23 +7,19 @@ use crate::{
 use log::error;
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
-use termion::cursor;
 use time::UtcOffset;
 use tokio::task;
 
 pub async fn run_task(emitter: EventEmitter<Command>, editor: Editor<()>) {
-    let prompt: Arc<str> = Arc::from(format!("{}> ", cursor::Up(1)));
-
     let mut editor = Some(Box::new(editor));
     let mut error_count = 0;
 
     loop {
         let join_result = task::spawn_blocking({
-            let prompt = Arc::clone(&prompt);
             let mut editor = editor.take().unwrap();
 
             move || {
-                let result = editor.readline(&prompt);
+                let result = editor.readline("> ");
                 (editor, result)
             }
         })
@@ -32,7 +28,7 @@ pub async fn run_task(emitter: EventEmitter<Command>, editor: Editor<()>) {
         let (returned_editor, input) = match join_result {
             Ok(ret) => ret,
             Err(unhandled_error) => {
-                error!("Terminal reader task panicked: {unhandled_error}. Aborting CLI.");
+                error!("Terminal reader task panicked: {unhandled_error:?}. Aborting CLI.");
                 return;
             }
         };
@@ -58,7 +54,7 @@ pub async fn run_task(emitter: EventEmitter<Command>, editor: Editor<()>) {
             // Do nothing
             Err(ReadlineError::WindowResized | ReadlineError::Eof) => (),
             Err(error) => {
-                error!("Unexpected error when reading CLI input: {error}");
+                error!("Unexpected error when reading CLI input: {error:?}");
                 error_count += 1;
 
                 if error_count > 3 {
@@ -86,6 +82,7 @@ fn parse_command(input: &str) -> Option<Command> {
     match command {
         "stop" => Some(Command::Stop),
         "suo" | "set-utc-offset" => set_utc_offset(&args),
+        "uhist" => update_history(&args),
         _ => {
             println!("Unknown command \"{command}\"");
             None
@@ -129,4 +126,23 @@ fn set_utc_offset(args: &[&str]) -> Option<Command> {
     Config::get().utc_offset.set(offset);
     println!("Updated UTC offset");
     None
+}
+
+fn update_history(args: &[&str]) -> Option<Command> {
+    let max_updates = match args.get(0) {
+        Some(&arg) => match arg.parse::<usize>().map(NonZeroUsize::new) {
+            Ok(None) => {
+                println!("Update limit cannot be 0");
+                return None;
+            }
+            Ok(limit @ Some(_)) => limit,
+            Err(error) => {
+                println!("Failed to parse update limit: {error}");
+                return None;
+            }
+        },
+        None => None,
+    };
+
+    Some(Command::UpdateHistory { max_updates })
 }

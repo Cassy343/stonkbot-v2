@@ -24,7 +24,7 @@ use std::{
     sync::Mutex,
     thread,
 };
-use termion::color;
+use termion::{color, cursor};
 use time::OffsetDateTime;
 
 const FILE_SIZE_LIMIT: u64 = 50_000_000;
@@ -124,7 +124,6 @@ fn format_time(datetime: OffsetDateTime) -> String {
 struct CrateFilter;
 
 impl Filter for CrateFilter {
-    #[cfg(debug_assertions)]
     fn filter(&self, record: &Record) -> Response {
         match record.module_path() {
             Some(path) => {
@@ -137,11 +136,6 @@ impl Filter for CrateFilter {
             None => Response::Reject,
         }
     }
-
-    #[cfg(not(debug_assertions))]
-    fn filter(&self, _record: &Record) -> Response {
-        Response::Neutral
-    }
 }
 
 // Custom implementation for a console logger so that it doesn't mangle the user's commands
@@ -152,6 +146,7 @@ struct CustomConsoleAppender<P> {
 impl<P: ExternalPrinter + Send + 'static> Append for CustomConsoleAppender<P> {
     fn append(&self, record: &Record) -> Result<(), anyhow::Error> {
         let mut writer = Cursor::new(Vec::<u8>::new());
+        write!(writer, "{}", cursor::Up(1))?;
         match record.metadata().level() {
             Level::Error => write!(writer, "{}", color::Fg(color::Red))?,
             Level::Warn => write!(writer, "{}", color::Fg(color::LightYellow))?,
@@ -259,7 +254,7 @@ impl CustomLogRoller {
     // Attempts compress_log and prints an error if it fails
     fn try_compress_log(input_path: &str, output_path: &str) {
         if let Err(error) = Self::compress_log(Path::new(input_path), Path::new(output_path)) {
-            error!("Failed to compress log file: {}", error);
+            error!("Failed to compress log file: {error:?}");
         }
     }
 

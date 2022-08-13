@@ -1,14 +1,17 @@
 use anyhow::{anyhow, Context};
 use once_cell::sync::OnceCell;
+use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::fs;
 use std::{
     env::{self, VarError},
-    fs::{OpenOptions, File},
+    fs::{File, OpenOptions},
     io::{Read, Write},
-    sync::atomic::{AtomicU32, Ordering}, path::Path,
+    path::Path,
+    sync::atomic::{AtomicU32, Ordering},
 };
+use stock_symbol::Symbol;
 use time::UtcOffset;
-use std::fs;
 
 static GLOBAL_CONFIG: OnceCell<Config> = OnceCell::new();
 
@@ -21,6 +24,7 @@ pub struct Config {
     pub keys: ApiKeys,
     pub urls: Urls,
     pub trading: TradingConfig,
+    pub indicator_periods: IndicatorPeriodConfig,
     pub utc_offset: LocalOffset,
     pub force_open: bool,
 }
@@ -43,7 +47,9 @@ impl Config {
                 .context("Failed to open config file")?;
 
             let mut buf = String::with_capacity(usize::try_from(config_file.metadata()?.len())?);
-            config_file.read_to_string(&mut buf).context("Failed to read config file")?;
+            config_file
+                .read_to_string(&mut buf)
+                .context("Failed to read config file")?;
 
             match serde_json::from_str::<OnDiskConfig>(&buf) {
                 Ok(config) => config,
@@ -51,14 +57,18 @@ impl Config {
                     println!("Failed to read on-disk config ({error}), writing default config.");
                     let (default, buf) = OnDiskConfig::default_serialized();
                     drop(config_file);
-                    fs::write(config_path, buf.as_bytes()).context("Failed to write default config")?;
+                    fs::write(config_path, buf.as_bytes())
+                        .context("Failed to write default config")?;
                     default
                 }
             }
         } else {
-            let mut config_file = File::create(config_path).context("Failed to create config file")?;
+            let mut config_file =
+                File::create(config_path).context("Failed to create config file")?;
             let (default, buf) = OnDiskConfig::default_serialized();
-            config_file.write_all(buf.as_bytes()).context("Failed to write default config")?;
+            config_file
+                .write_all(buf.as_bytes())
+                .context("Failed to write default config")?;
             default
         };
 
@@ -85,6 +95,7 @@ impl Config {
             keys,
             urls: on_disk_config.urls,
             trading: on_disk_config.trading,
+            indicator_periods: on_disk_config.indicator_periods,
             utc_offset,
             force_open,
         };
@@ -192,15 +203,66 @@ impl<'de> Deserialize<'de> for LocalOffset {
 
 #[derive(Serialize, Deserialize)]
 pub struct TradingConfig {
+    pub sample_stock: Symbol,
     pub pre_open_hours_offset: u8,
     pub seconds_per_tick: u64,
+    pub max_hold_time: u32,
+    pub cash_buffer_factor: Decimal,
+    pub minimum_median_volume: u64,
 }
 
 impl Default for TradingConfig {
     fn default() -> Self {
         TradingConfig {
+            sample_stock: Symbol::from_str("AAPL").unwrap(),
             pre_open_hours_offset: 3,
             seconds_per_tick: 10,
+            max_hold_time: 7,
+            cash_buffer_factor: Decimal::new(16, 0),
+            minimum_median_volume: 750_000,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct IndicatorPeriodConfig {
+    // Accumulation/distribution line
+    pub adl: usize,
+    // Average directional index
+    pub adx: usize,
+    pub aroon: usize,
+    // On balance volume
+    pub obv: usize,
+    // Relative strength index
+    pub rsi: usize,
+    // Stochastic oscillator
+    pub so: usize,
+    // How far back to look when calculating performance
+    pub perf: usize,
+}
+
+impl IndicatorPeriodConfig {
+    pub fn max_period(&self) -> usize {
+        self.adl
+            .max(self.adx)
+            .max(self.aroon)
+            .max(self.obv)
+            .max(self.rsi)
+            .max(self.so)
+            .max(self.perf)
+    }
+}
+
+impl Default for IndicatorPeriodConfig {
+    fn default() -> Self {
+        IndicatorPeriodConfig {
+            adl: 28,
+            adx: 14,
+            aroon: 25,
+            obv: 28,
+            rsi: 14,
+            so: 14,
+            perf: 5,
         }
     }
 }
@@ -209,6 +271,7 @@ impl Default for TradingConfig {
 struct OnDiskConfig {
     urls: Urls,
     trading: TradingConfig,
+    indicator_periods: IndicatorPeriodConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     utc_offset: Option<LocalOffset>,
 }
@@ -216,7 +279,8 @@ struct OnDiskConfig {
 impl OnDiskConfig {
     fn default_serialized() -> (Self, String) {
         let default = Self::default();
-        let serialized = serde_json::to_string_pretty(&default).expect("Failed to serialize on-disk config");
+        let serialized =
+            serde_json::to_string_pretty(&default).expect("Failed to serialize on-disk config");
 
         (default, serialized)
     }

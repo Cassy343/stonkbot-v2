@@ -1,7 +1,7 @@
 pub mod clock;
 pub mod command;
 
-use std::{fmt::Debug, marker::PhantomData};
+use std::{fmt::Debug, marker::PhantomData, num::NonZeroUsize};
 
 use log::warn;
 use time::{Duration, OffsetDateTime};
@@ -68,6 +68,7 @@ impl From<ClockEvent> for Event {
 #[derive(Debug)]
 pub enum Command {
     Stop,
+    UpdateHistory { max_updates: Option<NonZeroUsize> },
 }
 
 #[derive(Debug)]

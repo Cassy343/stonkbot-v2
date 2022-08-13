@@ -1,8 +1,5 @@
 use super::{ClockEvent, EventEmitter};
-use crate::{
-    config::Config,
-    rest::{AlpacaRestApi, Clock},
-};
+use crate::{config::Config, entity::trading::Clock, rest::AlpacaRestApi};
 use log::error;
 use std::time::Duration as StdDuration;
 use time::{Duration as TimeDuration, OffsetDateTime};
@@ -129,7 +126,7 @@ async fn fetch_clock(rest: &AlpacaRestApi) -> Result<Clock, Panic> {
         match rest.clock().await {
             Ok(clock) => break Ok(clock),
             Err(error) => {
-                error!("Failed to fetch clock: {error}");
+                error!("Failed to fetch clock: {error:?}");
 
                 if retries >= 3 {
                     error!("Maximum number of retries exceeded. Initiating clock panic.");
