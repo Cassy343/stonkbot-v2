@@ -1,5 +1,4 @@
 use std::collections::hash_map::Entry;
-use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -8,13 +7,13 @@ use crate::entity::trading::*;
 use anyhow::anyhow;
 use anyhow::Context;
 use reqwest::{Client, Method, RequestBuilder};
+use rust_decimal::Decimal;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde::Deserializer;
 use std::time::Duration as StdDuration;
 use stock_symbol::Symbol;
 use time::format_description::well_known::Rfc3339;
-use time::Date;
 use time::Duration;
 use time::OffsetDateTime;
 use tokio::time::sleep;
@@ -89,10 +88,35 @@ impl AlpacaRestApi {
     pub async fn us_equities(&self) -> anyhow::Result<Vec<Equity>> {
         Self::send(
             self.trading_endpoint(Method::GET, "/assets")
-                .query(&[
-                    ("status", "active"),
-                    ("asset_class", "us_equity"),
-                ])
+                .query(&[("status", "active"), ("asset_class", "us_equity")]),
+        )
+        .await
+    }
+
+    pub async fn positions(&self) -> anyhow::Result<Vec<Position>> {
+        Self::send(self.trading_endpoint(Method::GET, "/positions")).await
+    }
+
+    pub async fn position(&self, symbol: Symbol) -> anyhow::Result<Position> {
+        Self::send(self.trading_endpoint(Method::GET, &format!("/positions/{symbol}"))).await
+    }
+
+    pub async fn liquidate_position(&self, symbol: Symbol) -> anyhow::Result<Order> {
+        Self::send(self.trading_endpoint(Method::DELETE, &format!("/positions/{symbol}"))).await
+    }
+
+    pub async fn sell_position(&self, symbol: Symbol, qty: Decimal) -> anyhow::Result<Order> {
+        Self::send(
+            self.trading_endpoint(Method::DELETE, &format!("/positions/{symbol}"))
+                .query(&[("qty", qty.round_dp(9))]),
+        )
+        .await
+    }
+
+    pub async fn submit_order(&self, order: &OrderRequest) -> anyhow::Result<Order> {
+        Self::send(
+            self.trading_endpoint(Method::POST, "/orders")
+                .body(serde_json::to_string(order)?.into_bytes()),
         )
         .await
     }

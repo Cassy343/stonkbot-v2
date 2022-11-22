@@ -17,6 +17,14 @@ use rustyline::Editor;
 use std::panic::{self, AssertUnwindSafe};
 use tokio::{runtime::Builder, task};
 
+/*
+TODO:
+ - Log major events (pre-open, open, etc)
+ - add status command
+ - log which symbols we're tracking for the day
+ - add command to query symbol info
+*/
+
 fn main() {
     if let Err(error) = setup_and_launch() {
         println!("{error:?}");
@@ -80,8 +88,10 @@ async fn launch(editor: Editor<()>) -> anyhow::Result<()> {
         events.new_emitter::<ClockEvent>(),
         rest_api.clone(),
     ));
+    let (stream, stream_task) = stream::make_task(events.new_emitter::<StreamEvent>());
+    task::spawn(stream_task);
 
-    engine::run(events, rest_api).await;
+    engine::run(events, rest_api, stream).await;
 
     command_task.await.unwrap();
     Ok(())

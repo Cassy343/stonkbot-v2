@@ -128,6 +128,7 @@ pub struct Urls {
     pub alpaca_api_base: String,
     pub alpaca_data_api: String,
     pub alpaca_stream_url: String,
+    pub alpaca_stream_endpoint: String,
 }
 
 impl Default for Urls {
@@ -136,6 +137,7 @@ impl Default for Urls {
             alpaca_api_base: "https://api.alpaca.markets/v2".to_owned(),
             alpaca_data_api: "https://data.alpaca.markets/v2".to_owned(),
             alpaca_stream_url: "wss://stream.data.alpaca.markets/v2".to_owned(),
+            alpaca_stream_endpoint: "iex".to_owned(),
         }
     }
 }
@@ -209,6 +211,7 @@ pub struct TradingConfig {
     pub max_hold_time: u32,
     pub cash_buffer_factor: Decimal,
     pub minimum_median_volume: u64,
+    pub max_position_count: usize,
 }
 
 impl Default for TradingConfig {
@@ -220,6 +223,7 @@ impl Default for TradingConfig {
             max_hold_time: 7,
             cash_buffer_factor: Decimal::new(16, 0),
             minimum_median_volume: 750_000,
+            max_position_count: 10,
         }
     }
 }

@@ -12,15 +12,14 @@ use crate::{
     config::{Config, IndicatorPeriodConfig},
     entity::data::{Bar, LossyBar},
     rest::AlpacaRestApi,
-    util::{SECONDS_TO_DAYS, f64_to_decimal},
+    util::{f64_to_decimal, SECONDS_TO_DAYS},
 };
 use futures::{executor::block_on, StreamExt};
 use log::{error, info, warn};
 use sqlx::{
-    database::HasArguments, query::Query, sqlite::SqlitePool,
-    Error as SqlxError, Row, Sqlite,
+    database::HasArguments, query::Query, sqlite::SqlitePool, Error as SqlxError, Row, Sqlite,
 };
-use std::{collections::HashSet};
+use std::collections::HashSet;
 
 pub struct SqliteLocalHistory {
     database_file: String,
@@ -908,7 +907,8 @@ mod entity {
 impl SqliteLocalHistory {
     fn timeframe_to_pulldates(start: OffsetDateTime, end: Option<OffsetDateTime>) -> (i64, i64) {
         let start_pulldate = start.unix_timestamp() / SECONDS_TO_DAYS;
-        let end_pulldate = end.map(|datetime| datetime.unix_timestamp() / SECONDS_TO_DAYS)
+        let end_pulldate = end
+            .map(|datetime| datetime.unix_timestamp() / SECONDS_TO_DAYS)
             .unwrap_or_else(|| {
                 // We add 2 here to avoid timezone weirdness. This pulldate should be greater than
                 // any pulldate in the database.
@@ -918,7 +918,14 @@ impl SqliteLocalHistory {
         (start_pulldate, end_pulldate)
     }
 
-    fn pohlcv_to_bar(pulldate: i64, open: f64, high: f64, low: f64, close: f64, volume: i64) -> anyhow::Result<Bar> {
+    fn pohlcv_to_bar(
+        pulldate: i64,
+        open: f64,
+        high: f64,
+        low: f64,
+        close: f64,
+        volume: i64,
+    ) -> anyhow::Result<Bar> {
         let time = OffsetDateTime::from_unix_timestamp(pulldate * SECONDS_TO_DAYS)?;
         let open = f64_to_decimal(open)?;
         let high = f64_to_decimal(high)?;
@@ -932,7 +939,7 @@ impl SqliteLocalHistory {
             high,
             low,
             close,
-            volume
+            volume,
         })
     }
 }
@@ -974,7 +981,7 @@ impl LocalHistory for SqliteLocalHistory {
             match result.entry(symbol) {
                 Entry::Occupied(mut entry) => {
                     entry.get_mut().push(bar);
-                },
+                }
                 Entry::Vacant(entry) => {
                     let mut bars = Vec::with_capacity(estimated_capacity);
                     bars.push(bar);
@@ -994,16 +1001,15 @@ impl LocalHistory for SqliteLocalHistory {
     ) -> anyhow::Result<Vec<Bar>> {
         let (start_pulldate, end_pulldate) = Self::timeframe_to_pulldates(start, end);
 
-        let mut last_market_day_data_stream =
-            sqlx::query_as::<_, (i64, f64, f64, f64, f64, i64)>(
-                "SELECT pulldate,open,high,low,close,volume \
+        let mut last_market_day_data_stream = sqlx::query_as::<_, (i64, f64, f64, f64, f64, i64)>(
+            "SELECT pulldate,open,high,low,close,volume \
                 FROM CS_Day WHERE pulldate >= ? AND pulldate <= ? AND symbol = ?\
                 ORDER BY pulldate ASC",
-            )
-            .bind(start_pulldate)
-            .bind(end_pulldate)
-            .bind(symbol.as_str())
-            .fetch(&self.connection_pool);
+        )
+        .bind(start_pulldate)
+        .bind(end_pulldate)
+        .bind(symbol.as_str())
+        .fetch(&self.connection_pool);
 
         let mut result = Vec::new();
 

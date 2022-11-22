@@ -1,124 +1,37 @@
-use std::{cell::Cell, cmp::Ordering, collections::BinaryHeap, sync::Arc};
+use std::{cell::Cell, cmp::Ordering};
 
-use crate::{
-    config::Config,
-    entity::data::Bar,
-    event::{ClockEvent, Command, Event, EventReceiver},
-    history::{self, LocalHistory},
-    rest::AlpacaRestApi,
-    util::cell_update,
-};
+use crate::{config::Config, entity::data::Bar, history::LocalHistory, util::cell_update};
 use anyhow::Context;
-use log::{error, warn};
-use num_traits::{Pow, ToPrimitive};
+use log::warn;
+use num_traits::ToPrimitive;
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 use rust_decimal::Decimal;
 use stock_symbol::Symbol;
 use time::{Duration, OffsetDateTime};
 use tokio::task;
 
-struct EngineData<H> {
-    rest: AlpacaRestApi,
-    local_history: Arc<H>,
-    should_buy: bool,
-}
+use super::engine_impl::Engine;
 
-pub async fn run(mut events: EventReceiver, rest: AlpacaRestApi) {
-    let local_history = match history::init_local_history().await {
-        Ok(hist) => Arc::new(hist),
-        Err(error) => {
-            error!("Failed to initialize local history: {error:?}");
-            return;
-        }
-    };
-
-    let mut engine_data = EngineData {
-        rest,
-        local_history,
-        should_buy: true,
-    };
-
-    log::info!("{:?}", on_pre_open(&mut engine_data).await);
-
-    loop {
-        let event = events.next().await;
-
-        match event {
-            Event::Clock(clock_event) => {
-                log::debug!("Received clock event: {clock_event:?}");
-            }
-            Event::Command(command) => {
-                if matches!(command, Command::Stop) {
-                    return;
-                }
-
-                handle_command(&mut engine_data, command);
-            }
-        }
-    }
-}
-
-async fn handle_clock_event(data: &mut EngineData<impl LocalHistory>, event: ClockEvent) {
-    match event {
-        ClockEvent::PreOpen => {}
-        ClockEvent::Open { next_close } => {}
-        ClockEvent::Tick {
-            duration_since_open,
-            duration_until_close,
-        } => {}
-        ClockEvent::Close { next_open } => {}
-        ClockEvent::Panic => {}
-    }
-}
-
-async fn on_pre_open(data: &mut EngineData<impl LocalHistory>) -> anyhow::Result<Vec<Symbol>> {
-    let mut retries = 0;
-
-    loop {
-        match data
-            .local_history
-            .update_history_to_present(&data.rest, None)
-            .await
-        {
-            Ok(()) => break,
-            Err(error) => {
-                retries += 1;
-                error!("Failed to update database history: {error:?}. Retry {retries}/3");
-
-                match Arc::get_mut(&mut data.local_history) {
-                    Some(hist) => {
-                        if let Err(error) = hist.refresh_connection().await {
-                            error!("Failed to refresh database connection: {error:?}");
-                        }
-                    }
-                    None => warn!("Could not refresh database connecton due to concurrent tasks"),
-                }
-
-                if retries >= 3 {
-                    break;
-                }
-            }
-        }
-    }
-
-    compute_candidate_stocks(data).await
-}
-
-async fn compute_candidate_stocks(
-    data: &mut EngineData<impl LocalHistory>,
+pub(super) async fn rank_stocks(
+    engine: &mut Engine<impl LocalHistory>,
 ) -> anyhow::Result<Vec<Symbol>> {
     let current_time = OffsetDateTime::now_utc();
-    let mut history = data
+    let mut history = engine
         .local_history
         .get_market_history(current_time - Duration::days(7 * 6), None)
         .await
         .context("Failed to fetch market history")?;
 
-    for equity in data.rest.us_equities().await? {
-        if !(equity.tradable && equity.fractionable) {
-            history.remove(&equity.symbol);
-        }
-    }
+    engine
+        .rest
+        .us_equities()
+        .await?
+        .into_iter()
+        .filter(|equity| !(equity.tradable && equity.fractionable))
+        .flat_map(|equity| equity.symbol.to_compact())
+        .for_each(|symbol| {
+            history.remove(&symbol);
+        });
 
     let candidates = task::spawn_blocking(move || {
         let config = Config::get();
@@ -129,7 +42,7 @@ async fn compute_candidate_stocks(
         let mut candidates = history
             .into_par_iter()
             .flat_map(|(symbol, bars)| {
-                candidacy(
+                compute_candidate(
                     symbol,
                     bars,
                     minimum_median_volume,
@@ -163,12 +76,10 @@ async fn compute_candidate_stocks(
 }
 
 fn decimal_to_f64(x: Decimal) -> f64 {
-    x.round_sf(12)
-        .and_then(|dec| dec.to_f64())
-        .unwrap_or_else(|| {
-            warn!("Failed to convert {x} to f64");
-            f64::NAN
-        })
+    x.round_dp(9).to_f64().unwrap_or_else(|| {
+        warn!("Failed to convert {x} to f64");
+        f64::NAN
+    })
 }
 
 struct Candidate {
@@ -176,7 +87,7 @@ struct Candidate {
     expected_return: f64,
 }
 
-fn candidacy(
+fn compute_candidate(
     symbol: Symbol,
     bars: Vec<Bar>,
     minimum_median_volume: u64,
@@ -280,7 +191,7 @@ fn approx_expected_return(
             || equity > ref_data.initial_equity
             || hold_time >= ref_data.max_hold_time
         {
-            let ret = (equity / ref_data.initial_equity).pow(1.0f64 / f64::from(hold_time));
+            let ret = (equity / ref_data.initial_equity).powf(f64::from(hold_time).recip());
             cell_update(&ref_data.average_positive_return, |apr| {
                 apr + ret * node_probability
             });
@@ -289,7 +200,7 @@ fn approx_expected_return(
 
         let expected_next_price = price * ref_data.expected_positive_return;
         let additional_shares = (ref_data.initial_value + debt - expected_next_price * shares)
-            / (price * (ref_data.expected_positive_return - 1.0));
+            / (expected_next_price - price);
 
         if additional_shares.is_sign_positive() {
             let to_buy = f64::min(cash / price, additional_shares);
@@ -316,28 +227,5 @@ fn approx_expected_return(
             shares,
             hold_time + 1,
         );
-    }
-}
-
-fn handle_command(data: &mut EngineData<impl LocalHistory>, command: Command) {
-    match command {
-        Command::UpdateHistory { max_updates } => {
-            let rest = data.rest.clone();
-            let local_history = Arc::clone(&data.local_history);
-
-            task::spawn(async move {
-                if let Err(error) = local_history
-                    .update_history_to_present(&rest, max_updates)
-                    .await
-                {
-                    error!("Failed to update database history: {error:?}");
-                }
-            });
-        }
-        Command::Stop => {
-            warn!(
-                "Stop command passed to command handler - this should have been handled externally"
-            );
-        }
     }
 }

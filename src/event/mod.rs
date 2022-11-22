@@ -1,15 +1,19 @@
 pub mod clock;
 pub mod command;
+pub mod stream;
 
 use std::{fmt::Debug, marker::PhantomData, num::NonZeroUsize};
 
 use log::warn;
+use stock_symbol::Symbol;
 use time::{Duration, OffsetDateTime};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
+use crate::entity::data::Bar;
+
 pub struct EventReceiver {
-    rx: Receiver<Event>,
-    tx: Sender<Event>,
+    rx: Receiver<EngineEvent>,
+    tx: Sender<EngineEvent>,
 }
 
 impl EventReceiver {
@@ -19,14 +23,14 @@ impl EventReceiver {
         Self { rx, tx }
     }
 
-    pub fn new_emitter<T: Into<Event> + Debug>(&self) -> EventEmitter<T> {
+    pub fn new_emitter<T: Into<EngineEvent> + Debug>(&self) -> EventEmitter<T> {
         EventEmitter {
             tx: self.tx.clone(),
             _marker: PhantomData,
         }
     }
 
-    pub async fn next(&mut self) -> Event {
+    pub async fn next(&mut self) -> EngineEvent {
         self.rx
             .recv()
             .await
@@ -35,11 +39,11 @@ impl EventReceiver {
 }
 
 pub struct EventEmitter<T> {
-    tx: Sender<Event>,
+    tx: Sender<EngineEvent>,
     _marker: PhantomData<fn(T)>,
 }
 
-impl<T: Into<Event> + Debug> EventEmitter<T> {
+impl<T: Into<EngineEvent> + Debug> EventEmitter<T> {
     pub async fn emit(&self, event: T) {
         if let Err(error) = self.tx.send(event.into()).await {
             warn!("Failed to emit event: {:?}", error.0);
@@ -47,21 +51,37 @@ impl<T: Into<Event> + Debug> EventEmitter<T> {
     }
 }
 
-#[derive(Debug)]
-pub enum Event {
-    Command(Command),
-    Clock(ClockEvent),
+impl<T> Clone for EventEmitter<T> {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+            _marker: PhantomData,
+        }
+    }
 }
 
-impl From<Command> for Event {
+#[derive(Debug)]
+pub enum EngineEvent {
+    Command(Command),
+    Clock(ClockEvent),
+    Stream(StreamEvent),
+}
+
+impl From<Command> for EngineEvent {
     fn from(event: Command) -> Self {
         Self::Command(event)
     }
 }
 
-impl From<ClockEvent> for Event {
+impl From<ClockEvent> for EngineEvent {
     fn from(event: ClockEvent) -> Self {
         Self::Clock(event)
+    }
+}
+
+impl From<StreamEvent> for EngineEvent {
+    fn from(event: StreamEvent) -> Self {
+        Self::Stream(event)
     }
 }
 
@@ -85,4 +105,9 @@ pub enum ClockEvent {
         next_open: OffsetDateTime,
     },
     Panic,
+}
+
+#[derive(Debug)]
+pub enum StreamEvent {
+    MinuteBar { symbol: Symbol, bar: Bar },
 }

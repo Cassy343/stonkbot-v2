@@ -3,7 +3,7 @@ use serde::Deserialize;
 use time::serde::rfc3339;
 use time::OffsetDateTime;
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct Bar {
     #[serde(rename = "t", with = "rfc3339")]
     pub time: OffsetDateTime,
