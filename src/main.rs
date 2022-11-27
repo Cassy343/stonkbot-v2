@@ -19,8 +19,6 @@ use tokio::{runtime::Builder, task};
 
 /*
 TODO:
- - Log major events (pre-open, open, etc)
- - add status command
  - log which symbols we're tracking for the day
  - add command to query symbol info
 */

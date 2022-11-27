@@ -87,6 +87,7 @@ impl From<StreamEvent> for EngineEvent {
 
 #[derive(Debug)]
 pub enum Command {
+    Status,
     Stop,
     UpdateHistory { max_updates: Option<NonZeroUsize> },
 }

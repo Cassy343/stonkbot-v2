@@ -27,6 +27,7 @@ pub struct Config {
     pub indicator_periods: IndicatorPeriodConfig,
     pub utc_offset: LocalOffset,
     pub force_open: bool,
+    pub qp_solver: Option<String>,
 }
 
 impl Config {
@@ -98,6 +99,7 @@ impl Config {
             indicator_periods: on_disk_config.indicator_periods,
             utc_offset,
             force_open,
+            qp_solver: on_disk_config.qp_solver,
         };
 
         GLOBAL_CONFIG
@@ -278,6 +280,8 @@ struct OnDiskConfig {
     indicator_periods: IndicatorPeriodConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     utc_offset: Option<LocalOffset>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    qp_solver: Option<String>,
 }
 
 impl OnDiskConfig {

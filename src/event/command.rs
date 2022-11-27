@@ -75,11 +75,16 @@ pub async fn run_task(emitter: EventEmitter<Command>, editor: Editor<()>) {
 fn parse_command(input: &str) -> Option<Command> {
     let input = input.trim();
 
+    if input.is_empty() {
+        return None;
+    }
+
     let mut components = input.split(' ');
     let command = components.next()?;
     let args = components.collect::<Vec<_>>();
 
     match command {
+        "status" => Some(Command::Status),
         "stop" => Some(Command::Stop),
         "suo" | "set-utc-offset" => set_utc_offset(&args),
         "uhist" => update_history(&args),

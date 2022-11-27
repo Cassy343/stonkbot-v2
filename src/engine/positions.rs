@@ -1,6 +1,7 @@
 use std::{collections::HashMap, path::Path};
 
 use anyhow::anyhow;
+use log::debug;
 use num_traits::FromPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -92,6 +93,8 @@ impl<H: LocalHistory> Engine<H> {
         &mut self,
         positions: &HashMap<Symbol, Position>,
     ) -> anyhow::Result<()> {
+        debug!("Running position manager pre-open tasks");
+
         let mut new_meta = HashMap::with_capacity(positions.len());
         for position in positions.values() {
             let meta = self.derive_position_metadata(position).await?;

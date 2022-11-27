@@ -1,5 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
+use log::debug;
 use rust_decimal::Decimal;
 use stock_symbol::Symbol;
 
@@ -10,22 +11,25 @@ use crate::{
     history::LocalHistory,
 };
 
-use super::{engine_impl::Engine, heuristic};
+use super::{
+    engine_impl::Engine,
+    portfolio::{self, Candidate},
+};
 
 pub struct EntryStrategy {
-    candidates: HashSet<Symbol>,
+    candidates: Vec<Candidate>,
 }
 
 impl EntryStrategy {
     pub fn new() -> Self {
         Self {
-            candidates: HashSet::new(),
+            candidates: Vec::new(),
         }
     }
 
     pub fn set_candidates(
         &mut self,
-        candidates_best_to_worst: Vec<Symbol>,
+        candidates_best_to_worst: Vec<Candidate>,
         positions: &HashMap<Symbol, Position>,
     ) {
         // Skip the top few since those tend to be strange edge cases
@@ -35,7 +39,7 @@ impl EntryStrategy {
         self.candidates = candidates_best_to_worst
             .into_iter()
             .skip(skip)
-            .filter(|symbol| !positions.contains_key(symbol))
+            .filter(|candidate| !positions.contains_key(&candidate.symbol))
             .take(max_positions)
             .collect();
     }
@@ -46,10 +50,35 @@ impl<H: LocalHistory> Engine<H> {
         &mut self,
         positions: &HashMap<Symbol, Position>,
     ) -> anyhow::Result<()> {
-        let candidates_best_to_worst = heuristic::rank_stocks(self).await?;
-        self.intraday
-            .entry_strategy
-            .set_candidates(candidates_best_to_worst, positions);
+        debug!("Running entry strategy pre-open tasks");
+
+        // let candidates_best_to_worst = portfolio::rank_stocks(self).await?;
+        // self.intraday
+        //     .entry_strategy
+        //     .set_candidates(candidates_best_to_worst, positions);
+
+        // let n = self.intraday.entry_strategy.candidates[0].returns.len();
+        // println!("{:?}", self.intraday.entry_strategy.candidates);
+        // let returns = (0..n)
+        //     .map(|i| {
+        //         self.intraday
+        //             .entry_strategy
+        //             .candidates
+        //             .iter()
+        //             .map(|candidate| candidate.returns[i])
+        //             .collect::<Vec<_>>()
+        //     })
+        //     .collect::<Vec<_>>();
+        // let probs = vec![1.0 / (n as f64); n];
+        // log::info!(
+        //     "{:?}",
+        //     crate::engine::kelly::balance_portfolio(
+        //         self.intraday.entry_strategy.candidates.len(),
+        //         &returns,
+        //         &probs
+        //     )
+        // );
+
         Ok(())
     }
 
@@ -61,7 +90,7 @@ impl<H: LocalHistory> Engine<H> {
                     .entry_strategy
                     .candidates
                     .iter()
-                    .cloned()
+                    .map(|candidate| candidate.symbol)
                     .collect(),
             ))
             .await;

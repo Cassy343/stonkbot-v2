@@ -1,9 +1,12 @@
 use std::{
     cell::Cell,
+    cmp::Ordering,
     fmt::{self, Display, Formatter},
     str::FromStr,
 };
 
+use log::warn;
+use num_traits::ToPrimitive;
 use once_cell::sync::Lazy;
 use rust_decimal::{prelude::FromPrimitive, Decimal};
 use serde::{
@@ -35,6 +38,14 @@ pub fn localize(datetime: OffsetDateTime) -> OffsetDateTime {
 #[inline]
 pub fn f64_to_decimal(float: f64) -> Result<Decimal, DecimalConversionError> {
     Decimal::from_f64(float).ok_or(DecimalConversionError)
+}
+
+#[inline]
+pub fn decimal_to_f64(x: Decimal) -> f64 {
+    x.round_dp(9).to_f64().unwrap_or_else(|| {
+        warn!("Failed to convert {x} to f64");
+        f64::NAN
+    })
 }
 
 #[inline]
@@ -149,5 +160,28 @@ impl<'de> Deserialize<'de> for WideSymbol {
         }
 
         deserializer.deserialize_str(WideSymbolVisitor)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TotalF64(pub f64);
+
+impl PartialEq for TotalF64 {
+    fn eq(&self, other: &Self) -> bool {
+        f64::total_cmp(&self.0, &other.0) == Ordering::Equal
+    }
+}
+
+impl Eq for TotalF64 {}
+
+impl PartialOrd for TotalF64 {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(f64::total_cmp(&self.0, &other.0))
+    }
+}
+
+impl Ord for TotalF64 {
+    fn cmp(&self, other: &Self) -> Ordering {
+        f64::total_cmp(&self.0, &other.0)
     }
 }

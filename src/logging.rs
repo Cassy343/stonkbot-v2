@@ -30,7 +30,7 @@ use time::OffsetDateTime;
 const FILE_SIZE_LIMIT: u64 = 50_000_000;
 
 #[cfg(debug_assertions)]
-const LEVEL_FILTER: LevelFilter = LevelFilter::Debug;
+const LEVEL_FILTER: LevelFilter = LevelFilter::Trace;
 #[cfg(not(debug_assertions))]
 const LEVEL_FILTER: LevelFilter = LevelFilter::Info;
 

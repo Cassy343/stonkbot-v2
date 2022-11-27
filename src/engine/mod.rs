@@ -5,8 +5,9 @@ use crate::{
 
 mod engine_impl;
 mod entry;
-mod heuristic;
+mod kelly;
 mod orders;
+mod portfolio;
 mod positions;
 mod trailing;
 
