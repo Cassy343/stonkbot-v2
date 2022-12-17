@@ -1,0 +1,71 @@
+[package]
+name = "engine"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+common = { path = "../common" }
+entity = { path = "../entity" }
+history = { path = "../history" }
+rest = { path = "../rest" }
+anyhow = "1.0.58"
+flate2 = "1.0.24"
+futures = "0.3.21"
+log = "0.4.17"
+num-traits = "0.2.15"
+rand = "0.8.5"
+rayon = "1.5.3"
+rustyline = "10.0.0"
+serde_json = "1.0.82"
+serde_with = "2.0.0"
+termion = "1.5.6"
+
+[dependencies.log4rs]
+version = "1.1.1"
+default-features = false
+features = [
+    "compound_policy",
+    "console_appender",
+    "rolling_file_appender",
+    "size_trigger"
+]
+
+[dependencies.rust_decimal]
+version = "1.25.0"
+default-features = false
+features = ["serde-with-arbitrary-precision", "serde-with-float", "maths"]
+
+[dependencies.serde]
+version = "1.0.140"
+features = ["derive"]
+
+[dependencies.stock-symbol]
+version = "0.3.0"
+features = ["serde"]
+
+[dependencies.time]
+version = "0.3.11"
+features = [
+    "serde",
+    "local-offset",
+    "formatting",
+    "serde-well-known"
+]
+
+[dependencies.tokio]
+version = "1.20.1"
+default-features = false
+features = [
+    "net",
+    "rt",
+    "sync",
+    "time"
+]
+
+[dependencies.tokio-tungstenite]
+version = "0.17.2"
+features = ["rustls-tls-webpki-roots"]
+
+[dependencies.uuid]
+version = "1.1.2"
+features = ["serde"]

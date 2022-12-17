@@ -1,4 +1,8 @@
 use anyhow::anyhow;
+use entity::{
+    data::Bar,
+    stream::{StreamAction, StreamMessage, SuccessMessage},
+};
 use futures::{
     stream::{SplitSink, SplitStream},
     Future, SinkExt, StreamExt,
@@ -6,7 +10,7 @@ use futures::{
 use log::{error, warn};
 use std::{
     borrow::Cow,
-    collections::BTreeSet,
+    collections::{BTreeSet, HashSet},
     mem,
     time::{Duration, Instant},
 };
@@ -18,13 +22,7 @@ use tokio::{
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
-use crate::{
-    config::Config,
-    entity::{
-        data::Bar,
-        stream::{StreamAction, StreamMessage, SuccessMessage},
-    },
-};
+use common::config::Config;
 
 use super::{EventEmitter, StreamEvent};
 
@@ -214,6 +212,9 @@ async fn handle_request(stream: &mut Stream, request: StreamRequest) {
         }
         StreamRequest::SubscribeBars(bars) => {
             stream.expected_sub_state.add_bars(bars);
+        }
+        StreamRequest::UnsubscribeBars(bars) => {
+            stream.expected_sub_state.remove_bars(bars);
         }
         StreamRequest::Close => {
             if let StreamState::Open { mut send, .. } =
@@ -500,6 +501,7 @@ enum IncomingEvent {
 pub enum StreamRequest {
     Open,
     SubscribeBars(Vec<Symbol>),
+    UnsubscribeBars(Vec<Symbol>),
     Close,
 }
 
@@ -518,6 +520,11 @@ impl SubscriptionState {
 
     fn add_bars(&mut self, symbols: impl IntoIterator<Item = Symbol>) {
         self.bars.extend(symbols)
+    }
+
+    fn remove_bars(&mut self, symbols: impl IntoIterator<Item = Symbol>) {
+        let symbols = symbols.into_iter().collect::<HashSet<_>>();
+        self.bars.retain(|symbol| !symbols.contains(symbol));
     }
 
     fn set_bars(&mut self, bars: BTreeSet<Symbol>) {

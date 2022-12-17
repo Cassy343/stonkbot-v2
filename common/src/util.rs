@@ -14,12 +14,7 @@ use serde::{
     Deserialize, Deserializer, Serialize, Serializer,
 };
 use stock_symbol::Symbol;
-use time::{
-    format_description::{self, FormatItem},
-    OffsetDateTime,
-};
-
-use crate::config::Config;
+use time::format_description::{self, FormatItem};
 
 pub const SECONDS_TO_DAYS: i64 = 24 * 60 * 60;
 
@@ -30,10 +25,6 @@ pub static TIME_FORMAT: Lazy<Vec<FormatItem<'static>>> = Lazy::new(|| {
 
 pub static DATE_FORMAT: Lazy<Vec<FormatItem<'static>>> =
     Lazy::new(|| format_description::parse("[year]-[month]-[day]").expect("Invalid date format"));
-
-pub fn localize(datetime: OffsetDateTime) -> OffsetDateTime {
-    datetime.to_offset(Config::get().utc_offset.get())
-}
 
 #[inline]
 pub fn f64_to_decimal(float: f64) -> Result<Decimal, DecimalConversionError> {

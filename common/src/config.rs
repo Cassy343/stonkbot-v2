@@ -11,7 +11,7 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 use stock_symbol::Symbol;
-use time::UtcOffset;
+use time::{OffsetDateTime, UtcOffset};
 
 static GLOBAL_CONFIG: OnceCell<Config> = OnceCell::new();
 
@@ -105,6 +105,10 @@ impl Config {
         GLOBAL_CONFIG
             .set(me)
             .map_err(|_| anyhow!("Config already initialized"))
+    }
+
+    pub fn localize(datetime: OffsetDateTime) -> OffsetDateTime {
+        datetime.to_offset(Self::get().utc_offset.get())
     }
 }
 

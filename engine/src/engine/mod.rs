@@ -1,7 +1,5 @@
-use crate::{
-    event::{stream::StreamRequestSender, EventReceiver},
-    rest::AlpacaRestApi,
-};
+use crate::event::{stream::StreamRequestSender, EventReceiver};
+use rest::AlpacaRestApi;
 
 mod engine_impl;
 mod entry;

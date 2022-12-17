@@ -2,10 +2,10 @@ use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::time::Instant;
 
-use crate::config::Config;
-use crate::entity::trading::*;
 use anyhow::anyhow;
 use anyhow::Context;
+use common::config::Config;
+use entity::trading::*;
 use reqwest::{Client, Method, RequestBuilder};
 use rust_decimal::Decimal;
 use serde::de::DeserializeOwned;
@@ -95,6 +95,18 @@ impl AlpacaRestApi {
 
     pub async fn positions(&self) -> anyhow::Result<Vec<Position>> {
         Self::send(self.trading_endpoint(Method::GET, "/positions")).await
+    }
+
+    pub async fn position_map(&self) -> anyhow::Result<HashMap<Symbol, Position>> {
+        self.positions()
+            .await
+            .context("Faled to fetch positions")
+            .map(|position_vec| {
+                position_vec
+                    .into_iter()
+                    .map(|position| (position.symbol, position))
+                    .collect::<HashMap<_, _>>()
+            })
     }
 
     pub async fn position(&self, symbol: Symbol) -> anyhow::Result<Position> {
@@ -234,8 +246,10 @@ struct AlpacaBarsResponse<B: DeserializeOwned> {
         default = "Vec::new"
     )]
     pub bars: Vec<B>,
+    #[allow(dead_code)]
     pub symbol: Symbol,
     #[serde(default)]
+    #[allow(dead_code)]
     pub next_page_token: Option<String>,
 }
 

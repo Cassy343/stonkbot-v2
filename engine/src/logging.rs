@@ -1,4 +1,4 @@
-use crate::util;
+use common::util;
 use flate2::{write::GzEncoder, Compression};
 use log::*;
 use log4rs::{
@@ -109,7 +109,7 @@ pub fn cleanup() {
 }
 
 fn current_time() -> OffsetDateTime {
-    util::localize(OffsetDateTime::now_utc())
+    common::config::Config::localize(OffsetDateTime::now_utc())
 }
 
 fn format_time(datetime: OffsetDateTime) -> String {
@@ -127,7 +127,10 @@ impl Filter for CrateFilter {
     fn filter(&self, record: &Record) -> Response {
         match record.module_path() {
             Some(path) => {
-                if path.starts_with("stonkbot") {
+                if ["common", "entity", "engine", "history", "rest"]
+                    .iter()
+                    .any(|&krate| path.starts_with(krate))
+                {
                     Response::Accept
                 } else {
                     Response::Reject
@@ -151,6 +154,7 @@ impl<P: ExternalPrinter + Send + 'static> Append for CustomConsoleAppender<P> {
             Level::Error => write!(writer, "{}", color::Fg(color::Red))?,
             Level::Warn => write!(writer, "{}", color::Fg(color::LightYellow))?,
             Level::Debug => write!(writer, "{}", color::Fg(color::LightCyan))?,
+            Level::Trace => write!(writer, "{}", color::Fg(color::LightMagenta))?,
             _ => write!(writer, "{}", color::Fg(color::Reset))?,
         }
         format_record!(&mut writer, record)?;

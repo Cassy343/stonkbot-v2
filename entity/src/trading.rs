@@ -1,5 +1,6 @@
 use std::fmt::{self, Debug, Display, Formatter};
 
+use common::util::WideSymbol;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_with::skip_serializing_none;
@@ -7,8 +8,6 @@ use stock_symbol::Symbol;
 use time::serde::rfc3339;
 use time::OffsetDateTime;
 use uuid::Uuid;
-
-use crate::util::WideSymbol;
 
 #[derive(Deserialize)]
 pub struct Account {

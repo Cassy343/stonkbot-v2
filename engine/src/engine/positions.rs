@@ -1,6 +1,7 @@
 use std::{collections::HashMap, path::Path};
 
 use anyhow::anyhow;
+use entity::trading::Position;
 use log::debug;
 use num_traits::FromPrimitive;
 use rust_decimal::Decimal;
@@ -11,7 +12,7 @@ use tokio::io::AsyncReadExt;
 use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 
 use crate::event::stream::StreamRequest;
-use crate::{entity::trading::Position, history::LocalHistory};
+use history::LocalHistory;
 
 use super::engine_impl::Engine;
 use anyhow::Context;
@@ -89,14 +90,11 @@ impl PositionManager {
 }
 
 impl<H: LocalHistory> Engine<H> {
-    pub async fn position_manager_on_pre_open(
-        &mut self,
-        positions: &HashMap<Symbol, Position>,
-    ) -> anyhow::Result<()> {
+    pub async fn position_manager_on_pre_open(&mut self) -> anyhow::Result<()> {
         debug!("Running position manager pre-open tasks");
 
-        let mut new_meta = HashMap::with_capacity(positions.len());
-        for position in positions.values() {
+        let mut new_meta = HashMap::with_capacity(self.intraday.last_position_map.len());
+        for position in self.intraday.last_position_map.values() {
             let meta = self.derive_position_metadata(position).await?;
             new_meta.insert(position.symbol, meta);
         }
@@ -161,20 +159,17 @@ impl<H: LocalHistory> Engine<H> {
         }
     }
 
-    pub async fn position_manager_on_open(&mut self, positions: &HashMap<Symbol, Position>) {
+    pub async fn position_manager_on_open(&mut self) {
         self.intraday
             .stream
             .send(StreamRequest::SubscribeBars(
-                positions.keys().cloned().collect(),
+                self.intraday.last_position_map.keys().cloned().collect(),
             ))
             .await;
     }
 
-    pub async fn position_sell_trigger(
-        &mut self,
-        symbol: Symbol,
-        positions: &HashMap<Symbol, Position>,
-    ) -> anyhow::Result<()> {
+    pub async fn position_sell_trigger(&mut self, symbol: Symbol) -> anyhow::Result<()> {
+        // If selling would count as a day trade, then don't sell
         if !self
             .intraday
             .order_manager
@@ -184,96 +179,68 @@ impl<H: LocalHistory> Engine<H> {
             return Ok(());
         }
 
-        let position = match positions.get(&symbol) {
+        // Make sure the symbol is actually a position we hold
+        let position = match self.intraday.last_position_map.get(&symbol) {
             Some(pos) => pos,
             None => return Ok(()),
         };
 
+        // If we've made a profit then just sell it all
         if position.unrealized_plpc.is_sign_positive() {
             return self.intraday.order_manager.liquidate(symbol).await;
         }
 
-        let meta = match self.position_manager.position_meta.get(&symbol) {
-            Some(meta) => meta,
-            None => return Ok(()),
-        };
+        let optimal_equity = self
+            .portfolio_manager_optimal_equity(symbol)
+            .ok_or_else(|| anyhow!("Currently held position in {symbol} not in portfolio"))?;
+        let current_equity = position.market_value;
 
-        let additional_shares =
-            PositionManager::compute_additional_shares(meta, &position, Decimal::ZERO);
-        if additional_shares.is_sign_negative() {
-            let qty = additional_shares.abs();
-            self.intraday.order_manager.sell(symbol, qty).await?;
+        let surplus = current_equity - optimal_equity;
+        if surplus <= Decimal::ONE {
+            return Ok(());
         }
+
+        let qty = surplus / position.current_price;
+        self.intraday.order_manager.sell(symbol, qty).await?;
 
         Ok(())
     }
 
-    pub async fn position_buy_trigger(
-        &mut self,
-        symbol: Symbol,
-        positions: &HashMap<Symbol, Position>,
-        mut cash: Decimal,
-    ) -> anyhow::Result<Decimal> {
+    pub async fn position_buy_trigger(&mut self, symbol: Symbol) -> anyhow::Result<()> {
         if !self
             .intraday
             .order_manager
             .trade_status(symbol)
             .is_buy_daytrade_safe()
         {
-            return Ok(cash);
+            return Ok(());
         }
 
         self.position_manager
             .position_meta
-            .retain(|symbol, _| positions.contains_key(symbol));
+            .retain(|symbol, _| self.intraday.last_position_map.contains_key(symbol));
 
-        let mut adjustments = Vec::new();
-        let mut success_probability_sum = Decimal::ZERO;
+        let position = match self.intraday.last_position_map.get(&symbol) {
+            Some(pos) => pos,
+            None => return Ok(()),
+        };
 
-        struct Adjustment {
-            symbol: Symbol,
-            fraction: Decimal,
-            additional_shares: Decimal,
-            price: Decimal,
+        let optimal_equity = self
+            .portfolio_manager_optimal_equity(symbol)
+            .ok_or_else(|| anyhow!("Currently held position in {symbol} not in portfolio"))?;
+        let current_equity = position.market_value;
+
+        let deficit = optimal_equity - current_equity;
+        let cash = self.portfolio_manager_available_cash();
+        let notional = Decimal::min(deficit, cash);
+
+        if notional <= Decimal::ONE {
+            return Ok(());
         }
 
-        for (&symbol, meta) in &self.position_manager.position_meta {
-            // Unwrap must succeed given the retention above
-            let position = positions.get(&symbol).unwrap();
+        self.intraday.order_manager.buy(symbol, notional).await?;
 
-            let additional_shares =
-                PositionManager::compute_additional_shares(meta, position, cash);
-            if additional_shares.is_sign_positive() {
-                success_probability_sum += meta.epr_prob;
-                adjustments.push(Adjustment {
-                    symbol,
-                    fraction: meta.epr_prob,
-                    additional_shares,
-                    price: position.current_price,
-                });
-            }
-        }
-
-        adjustments
-            .iter_mut()
-            .for_each(|adj| adj.fraction /= success_probability_sum);
-        adjustments.sort_unstable_by_key(|decimal| decimal.fraction);
-
-        for adj in adjustments.into_iter().rev() {
-            let allotted_cash = cash * adj.fraction;
-            let cash_reduction = Decimal::min(adj.additional_shares * adj.price, allotted_cash);
-            cash -= cash_reduction;
-
-            if adj.symbol == symbol {
-                self.intraday
-                    .order_manager
-                    .buy(symbol, cash_reduction)
-                    .await?;
-                break;
-            }
-        }
-
-        Ok(cash)
+        Ok(())
     }
 }
 

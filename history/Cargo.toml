@@ -1,0 +1,25 @@
+[package]
+name = "history"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+common = { path = "../common" }
+entity = { path = "../entity" }
+rest = { path = "../rest" }
+anyhow = "1.0.58"
+async-trait = "0.1.57"
+futures = "0.3.21"
+log = "0.4.17"
+
+[dependencies.sqlx]
+version = "0.6.1"
+features = ["runtime-tokio-rustls", "sqlite"]
+
+[dependencies.stock-symbol]
+version = "0.3.0"
+features = ["sqlx"]
+
+[dependencies.time]
+version = "0.3.11"
+features = []

@@ -3,7 +3,8 @@ use std::{collections::HashMap, num::NonZeroUsize};
 use stock_symbol::Symbol;
 use time::OffsetDateTime;
 
-use crate::{entity::data::Bar, rest::AlpacaRestApi};
+use entity::data::Bar;
+use rest::AlpacaRestApi;
 
 #[async_trait]
 pub trait LocalHistory: Send + Sync + 'static {

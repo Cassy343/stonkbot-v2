@@ -1,6 +1,6 @@
 use log::trace;
 
-const EPSILON: f64 = 1e-5;
+const EPSILON: f64 = 1e-7;
 
 pub fn compute_kelly_bet(returns: &[f64], probabilities: &[f64]) -> f64 {
     debug_assert_eq!(returns.len(), probabilities.len());
@@ -75,28 +75,50 @@ where
         .sum::<f64>()
 }
 
-pub fn balance_portfolio<T>(positions: usize, returns: &[T], probabilities: &[f64]) -> Vec<f64>
+pub fn optimize_portfolio<T>(
+    positions: usize,
+    returns: &[T],
+    probabilities: &[f64],
+) -> OptimizedPortfolio
 where
     T: AsRef<[f64]>,
 {
-    const STEP: f64 = 0.05;
+    const MAX_ITERS: i32 = 65536;
 
-    let mut ret = vec![0.0; positions];
+    let mut step = f64::sqrt(positions as f64) / 10.0;
+    let mut fractions = vec![0.0; positions];
+    let mut prev_exp_return = f64::MIN;
     let mut grad = vec![0.0; positions];
-    let mut i = 0;
 
-    loop {
-        // Compute the gradient
-        returns.iter().zip(probabilities).for_each(|(r, &p)| {
-            let r = r.as_ref();
-            let denom = 1.0 + ret.iter().zip(r).map(|(&f, &r)| f * r).sum::<f64>();
-            grad.iter_mut()
-                .zip(r)
-                .for_each(|(g, &r)| *g += (r * p) / denom);
-        });
+    for i in 0..MAX_ITERS {
+        // Compute the gradient and expected return
+        let exp_return = returns
+            .iter()
+            .zip(probabilities)
+            .map(|(r, &p)| {
+                let r = r.as_ref();
+                let denom = 1.0 + fractions.iter().zip(r).map(|(&f, &r)| f * r).sum::<f64>();
+                grad.iter_mut()
+                    .zip(r)
+                    .for_each(|(g, &r)| *g += (r * p) / denom);
+                p * f64::ln(denom)
+            })
+            .sum::<f64>();
+
+        if !exp_return.is_finite() {
+            step /= 2.0;
+            fractions = vec![0.0; positions];
+            prev_exp_return = f64::MIN;
+            continue;
+        }
+
+        if exp_return <= prev_exp_return {
+            step /= 2.0;
+        }
+        prev_exp_return = exp_return;
 
         // Compute the norm of the gradient and make sure it's constraint-compliant
-        let norm = ret
+        let norm = fractions
             .iter_mut()
             .zip(&mut grad)
             .map(|(f, g)| {
@@ -114,20 +136,29 @@ where
 
         if norm < EPSILON {
             trace!("Iterations: {i}");
-            return ret;
+            break;
         }
 
-        let mul = STEP / norm;
+        let mul = step / norm;
 
         // Apply gradient to return vector and reset it to zero
-        ret.iter_mut().zip(&mut grad).for_each(|(f, g)| {
+        fractions.iter_mut().zip(&mut grad).for_each(|(f, g)| {
             *f += *g * mul;
             *g = 0.0;
         });
 
-        i += 1;
-        if i % 1024 == 0 {
-            trace!("Iterations: {i}");
+        if i == MAX_ITERS - 1 {
+            trace!("Iterations maxed out");
         }
     }
+
+    OptimizedPortfolio {
+        fractions,
+        expected_return: prev_exp_return,
+    }
+}
+
+pub struct OptimizedPortfolio {
+    pub fractions: Vec<f64>,
+    pub expected_return: f64,
 }

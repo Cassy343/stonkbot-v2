@@ -1,9 +1,7 @@
 use std::{num::NonZeroUsize, time::Duration};
 
-use crate::{
-    config::Config,
-    event::{Command, EventEmitter},
-};
+use crate::event::{Command, EventEmitter};
+use common::config::Config;
 use log::error;
 use rustyline::error::ReadlineError;
 use rustyline::Editor;

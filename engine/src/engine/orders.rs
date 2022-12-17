@@ -1,12 +1,10 @@
 use std::collections::HashMap;
 
+use entity::trading::{OrderRequest, OrderSide, OrderTimeInForce, OrderType};
 use rust_decimal::Decimal;
 use stock_symbol::Symbol;
 
-use crate::{
-    entity::trading::{OrderRequest, OrderSide, OrderTimeInForce, OrderType},
-    rest::AlpacaRestApi,
-};
+use rest::AlpacaRestApi;
 
 pub struct OrderManager {
     rest: AlpacaRestApi,

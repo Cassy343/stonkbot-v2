@@ -1,30 +1,24 @@
+use super::{
+    entry::EntryStrategy, orders::OrderManager, portfolio::PortfolioManager,
+    positions::PositionManager, trailing::PriceTracker,
+};
+use crate::event::{
+    stream::{StreamRequest, StreamRequestSender},
+    ClockEvent, Command, EngineEvent, EventReceiver, StreamEvent,
+};
+use entity::trading::{Account, Position};
+use history::{self, LocalHistory};
+use log::{debug, error, info, warn};
+use rest::AlpacaRestApi;
+use rust_decimal::Decimal;
 use std::{
     collections::HashMap,
     io::{self, Cursor, Write},
     sync::Arc,
 };
-
-use crate::{
-    entity::trading::Position,
-    event::{
-        stream::{StreamRequest, StreamRequestSender},
-        ClockEvent, Command, EngineEvent, EventReceiver, StreamEvent,
-    },
-    history::{self, LocalHistory},
-    rest::AlpacaRestApi,
-    util::decimal_to_f64,
-};
-use anyhow::Context;
-use log::{debug, error, info, warn};
-use rust_decimal::Decimal;
 use stock_symbol::Symbol;
 use time::{Duration, OffsetDateTime};
 use tokio::task;
-
-use super::{
-    entry::EntryStrategy, orders::OrderManager, portfolio::PortfolioManager,
-    positions::PositionManager, trailing::PriceTracker,
-};
 
 pub struct Engine<H> {
     pub rest: AlpacaRestApi,
@@ -42,6 +36,8 @@ pub struct IntradayTracker {
     pub portfolio_manager: PortfolioManager,
     pub stream: StreamRequestSender,
     pub entry_strategy: EntryStrategy,
+    pub last_position_map: HashMap<Symbol, Position>,
+    pub last_account: Account,
 }
 
 #[derive(Default)]
@@ -70,6 +66,15 @@ pub async fn run(events: EventReceiver, rest: AlpacaRestApi, stream: StreamReque
         }
     };
 
+    let (last_position_map, last_account) = match (rest.position_map().await, rest.account().await)
+    {
+        (Ok(position_map), Ok(account)) => (position_map, account),
+        _ => {
+            error!("Failed to fetch initial data from alpaca");
+            return;
+        }
+    };
+
     let mut engine = Engine {
         rest,
         local_history,
@@ -79,6 +84,8 @@ pub async fn run(events: EventReceiver, rest: AlpacaRestApi, stream: StreamReque
             portfolio_manager: PortfolioManager::new(),
             stream,
             entry_strategy: EntryStrategy::new(),
+            last_position_map,
+            last_account,
         },
         position_manager,
         should_buy: true,
@@ -86,81 +93,47 @@ pub async fn run(events: EventReceiver, rest: AlpacaRestApi, stream: StreamReque
         clock_debug_info: ClockDebugInfo::default(),
     };
 
-    // let now = OffsetDateTime::now_utc();
-    // let start = now - time::Duration::days(7 * 10);
-    // let hist = engine
-    //     .local_history
-    //     .get_market_history(start, None)
-    //     .await
-    //     .unwrap();
-    // let mut prices = Vec::with_capacity(3);
-    // prices.push(hist.get(&Symbol::from_str("AAPL").unwrap()).unwrap());
-    // prices.push(hist.get(&Symbol::from_str("GM").unwrap()).unwrap());
-    // prices.push(hist.get(&Symbol::from_str("ORCL").unwrap()).unwrap());
-    // prices.push(hist.get(&Symbol::from_str("MRNA").unwrap()).unwrap());
-    // let returns = prices
-    //     .into_iter()
-    //     .map(|p| {
-    //         p.windows(2)
-    //             .map(|w| decimal_to_f64((w[1].close - w[0].close) / w[0].close))
-    //             .collect::<Vec<_>>()
-    //     })
-    //     .collect::<Vec<_>>();
-    // let n = returns[0].len();
-    // let returns = (0..n)
-    //     .map(|i| returns.iter().map(|r| r[i]).collect::<Vec<_>>())
-    //     .collect::<Vec<_>>();
-    // let probabilities = vec![1.0 / n as f64; n];
-    // log::info!("{returns:?}\n{probabilities:?}");
-    // let res = crate::engine::kelly::balance_portfolio(4, &returns, &probabilities);
-    // log::info!("{res:?}");
+    // TODO: remove
     engine.on_pre_open().await.unwrap();
 
-    run_inner(&mut engine, events).await;
+    engine.run(events).await;
 
     if let Err(error) = engine.position_manager.save_metadata().await {
         error!("Failed to save position metadata: {error:?}");
     }
 }
 
-async fn run_inner(engine: &mut Engine<impl LocalHistory>, mut events: EventReceiver) {
-    loop {
-        let event = events.next().await;
+impl<H: LocalHistory> Engine<H> {
+    async fn run(&mut self, mut events: EventReceiver) {
+        loop {
+            let event = events.next().await;
 
-        match event {
-            EngineEvent::Clock(clock_event) => {
-                if !engine.in_safety_mode {
-                    engine.handle_clock_event(clock_event).await;
+            match event {
+                EngineEvent::Clock(clock_event) => {
+                    if !self.in_safety_mode {
+                        self.handle_clock_event(clock_event).await;
+                    }
                 }
-            }
-            EngineEvent::Command(command) => {
-                if matches!(command, Command::Stop) {
-                    return;
-                }
+                EngineEvent::Command(command) => {
+                    if matches!(command, Command::Stop) {
+                        return;
+                    }
 
-                engine.handle_command(command).await;
-            }
-            EngineEvent::Stream(stream_event) => {
-                if !engine.in_safety_mode {
-                    engine.handle_stream_event(stream_event);
+                    self.handle_command(command).await;
+                }
+                EngineEvent::Stream(stream_event) => {
+                    if !self.in_safety_mode {
+                        self.handle_stream_event(stream_event);
+                    }
                 }
             }
         }
     }
-}
 
-impl<H: LocalHistory> Engine<H> {
-    async fn position_map(&self) -> anyhow::Result<HashMap<Symbol, Position>> {
-        self.rest
-            .positions()
-            .await
-            .context("Faled to fetch positions")
-            .map(|position_vec| {
-                position_vec
-                    .into_iter()
-                    .map(|position| (position.symbol, position))
-                    .collect::<HashMap<_, _>>()
-            })
+    async fn update_account_info(&mut self) -> anyhow::Result<()> {
+        self.intraday.last_position_map = self.rest.position_map().await?;
+        self.intraday.last_account = self.rest.account().await?;
+        Ok(())
     }
 
     async fn handle_clock_event(&mut self, event: ClockEvent) {
@@ -178,7 +151,10 @@ impl<H: LocalHistory> Engine<H> {
                 self.clock_debug_info.next_close = Some(next_close);
 
                 self.intraday.stream.send(StreamRequest::Open).await;
-                self.on_open().await;
+                if let Err(error) = self.on_open().await {
+                    error!("Failed to run open tasks: {error:?}");
+                    self.in_safety_mode = true;
+                }
             }
             ClockEvent::Tick {
                 duration_since_open,
@@ -186,6 +162,10 @@ impl<H: LocalHistory> Engine<H> {
             } => {
                 self.clock_debug_info.duration_since_open = Some(duration_since_open);
                 self.clock_debug_info.duration_until_close = Some(duration_until_close);
+
+                if let Err(error) = self.on_tick().await {
+                    error!("Tick failed: {error:?}");
+                }
             }
             ClockEvent::Close { next_open } => {
                 debug!("Received close event (next open: {next_open:?}");
@@ -231,21 +211,28 @@ impl<H: LocalHistory> Engine<H> {
             }
         }
 
-        debug!("Fetching positions");
-        let positions = self.position_map().await?;
+        self.update_account_info().await?;
 
-        self.portfolio_manager_on_pre_open(&positions).await?;
-        self.position_manager_on_pre_open(&positions).await?;
-        self.entry_strat_on_pre_open(&positions).await?;
+        self.portfolio_manager_on_pre_open().await?;
+        self.position_manager_on_pre_open().await?;
 
         Ok(())
     }
 
     async fn on_open(&mut self) -> anyhow::Result<()> {
-        let positions = self.position_map().await?;
+        self.update_account_info().await?;
 
-        self.position_manager_on_open(&positions).await;
+        self.position_manager_on_open().await;
         self.entry_strat_on_open().await;
+
+        Ok(())
+    }
+
+    async fn on_tick(&mut self) -> anyhow::Result<()> {
+        self.update_account_info().await?;
+
+        self.portfolio_manager_on_tick();
+        self.entry_strat_on_tick().await;
 
         Ok(())
     }

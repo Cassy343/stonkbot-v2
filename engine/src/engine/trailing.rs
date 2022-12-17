@@ -1,10 +1,9 @@
 use std::collections::{hash_map::Entry, HashMap};
 
+use entity::data::Bar;
 use rust_decimal::Decimal;
 use stock_symbol::Symbol;
 use time::{Duration, Time};
-
-use crate::entity::data::Bar;
 
 pub struct PriceTracker {
     stocks: HashMap<Symbol, TrackedStock>,

@@ -1,18 +1,15 @@
 use std::{
-    cmp::Ordering,
     collections::{btree_map::Entry, BTreeMap, HashMap},
     time::Instant,
 };
 
-use crate::{
-    config::Config,
-    engine::kelly,
-    entity::{data::Bar, trading::Position},
-    history::LocalHistory,
-    util::{decimal_to_f64, TotalF64},
-};
+use crate::engine::kelly::{self, OptimizedPortfolio};
 use anyhow::{anyhow, Context};
-use log::debug;
+use common::util::{decimal_to_f64, TotalF64};
+use common::{config::Config, util::f64_to_decimal};
+use entity::{data::Bar, trading::Position};
+use history::LocalHistory;
+use log::{debug, error, trace};
 use rand::{thread_rng, Rng};
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 use rust_decimal::Decimal;
@@ -51,6 +48,10 @@ impl PortfolioManager {
         }
     }
 
+    pub fn portfolio(&self) -> &BTreeMap<Symbol, f64> {
+        &self.portfolio
+    }
+
     fn candidate_by_kelly(&self, kelly_index: TotalF64) -> Option<&Candidate> {
         self.kelly_indexed_candidates
             .range((Unbounded, Included(kelly_index)))
@@ -74,39 +75,59 @@ impl PortfolioManager {
             })
     }
 
-    pub fn optimize_portfolio(&mut self, positions: &HashMap<Symbol, Position>) {
+    fn optimize_portfolio_if_changed(&mut self, positions: &HashMap<Symbol, Position>) {
+        let current_carry_over = self
+            .portfolio
+            .keys()
+            .filter(|&symbol| self.position_hist_returns.contains_key(symbol))
+            .count();
+        let new_carry_over = positions
+            .keys()
+            .filter(|&symbol| self.position_hist_returns.contains_key(symbol))
+            .count();
+
+        if current_carry_over != new_carry_over {
+            self.optimize_portfolio(positions);
+        }
+    }
+
+    fn optimize_portfolio(&mut self, positions: &HashMap<Symbol, Position>) {
         debug!("Optimizing portfolio");
-        let start = Instant::now();
         let mut best_portfolio = BTreeMap::new();
         let mut best_exp_return = f64::MIN;
+        let start = Instant::now();
 
-        for _ in 0..100 {
-            debug!("1");
+        loop {
             self.select_random_portfolio(positions);
-            debug!("2");
             let ExpectationMatrices {
                 returns,
                 probabilities,
             } = self.generate_expectation_matrices();
-            debug!("3");
-            let opt = kelly::balance_portfolio(self.portfolio.len(), &returns, &probabilities);
-            debug!("4");
-            let exp_return = kelly::expected_log_portfolio_return(&opt, &returns, &probabilities);
-            debug!("{exp_return}");
+            let OptimizedPortfolio {
+                fractions,
+                expected_return,
+            } = kelly::optimize_portfolio(self.portfolio.len(), &returns, &probabilities);
+            trace!("{expected_return}");
             self.portfolio
                 .values_mut()
-                .zip(opt)
+                .zip(fractions)
                 .for_each(|(f, f_star)| *f = f_star);
-            debug!("5");
 
-            if exp_return > best_exp_return {
+            if expected_return > best_exp_return {
                 best_portfolio = self.portfolio.clone();
-                best_exp_return = exp_return;
+                best_exp_return = expected_return;
+            }
+
+            if start.elapsed() > std::time::Duration::from_secs(15) {
+                break;
             }
         }
 
-        let elapsed = start.elapsed();
-        debug!("Optimized portfolio in {elapsed:?}. Selected portfolio:\n{best_portfolio:#?}");
+        best_portfolio.retain(|k, &mut v| positions.contains_key(k) || v > 0.0);
+        let total = best_portfolio.values().sum::<f64>();
+        best_portfolio.values_mut().for_each(|f| *f /= total);
+
+        debug!("Optimized portfolio (exp. return: {best_exp_return:.3}). Selected portfolio:\n{best_portfolio:#?}");
 
         self.portfolio = best_portfolio;
     }
@@ -134,7 +155,6 @@ impl PortfolioManager {
                 let max = self.candidates_max_key;
 
                 while self.portfolio.len() < num_positions {
-                    debug!("{}", self.portfolio.len());
                     let key = TotalF64(rng.gen::<f64>() * max);
                     let selection = self
                         .candidate_by_kelly(key)
@@ -178,10 +198,29 @@ impl PortfolioManager {
 }
 
 impl<H: LocalHistory> Engine<H> {
-    pub async fn portfolio_manager_on_pre_open(
-        &mut self,
-        positions: &HashMap<Symbol, Position>,
-    ) -> anyhow::Result<()> {
+    pub fn portfolio_manager_optimal_equity(&self, symbol: Symbol) -> Option<Decimal> {
+        let fraction =
+            match f64_to_decimal(*self.intraday.portfolio_manager.portfolio.get(&symbol)?) {
+                Ok(f) => f,
+                Err(_) => {
+                    error!(
+                        "Failed to convert portfolio float fraction to decimal. Portfolio: {:?}",
+                        self.intraday.portfolio_manager.portfolio
+                    );
+                    return None;
+                }
+            };
+
+        let total_equity = self.intraday.last_account.equity;
+        let usable_equity = Decimal::new(95, 2) * total_equity;
+        Some(fraction * usable_equity)
+    }
+
+    pub fn portfolio_manager_available_cash(&self) -> Decimal {
+        self.intraday.last_account.cash * Decimal::new(95, 2)
+    }
+
+    pub async fn portfolio_manager_on_pre_open(&mut self) -> anyhow::Result<()> {
         debug!("Running portfolio manager pre-open task");
 
         let current_time = OffsetDateTime::now_utc();
@@ -198,6 +237,7 @@ impl<H: LocalHistory> Engine<H> {
             .clear();
 
         debug!("Collecting historical bars");
+        let positions = &self.intraday.last_position_map;
 
         for (symbol, hist) in positions
             .keys()
@@ -269,56 +309,12 @@ impl<H: LocalHistory> Engine<H> {
 
         Ok(())
     }
-}
 
-pub(super) async fn rank_stocks(
-    engine: &mut Engine<impl LocalHistory>,
-) -> anyhow::Result<Vec<Candidate>> {
-    let current_time = OffsetDateTime::now_utc();
-    let mut history = engine
-        .local_history
-        .get_market_history(current_time - Duration::days(7 * 6), None)
-        .await
-        .context("Failed to fetch market history")?;
-
-    engine
-        .rest
-        .us_equities()
-        .await?
-        .into_iter()
-        .filter(|equity| !(equity.tradable && equity.fractionable))
-        .flat_map(|equity| equity.symbol.to_compact())
-        .for_each(|symbol| {
-            history.remove(&symbol);
-        });
-
-    let candidates = task::spawn_blocking(move || {
-        let config = Config::get();
-        let minimum_median_volume = config.trading.minimum_median_volume;
-
-        let mut candidates = history
-            .into_par_iter()
-            .flat_map(|(symbol, bars)| compute_candidate(symbol, bars, minimum_median_volume))
-            .collect::<Vec<_>>();
-
-        candidates.sort_unstable_by(|a, b| {
-            match (a.kelly_bet.is_finite(), b.kelly_bet.is_finite()) {
-                (true, true) => b
-                    .kelly_bet
-                    .partial_cmp(&a.kelly_bet)
-                    .unwrap_or(Ordering::Equal),
-                (true, false) => Ordering::Less,
-                (false, true) => Ordering::Greater,
-                (false, false) => Ordering::Equal,
-            }
-        });
-
-        candidates
-    })
-    .await
-    .context("Heuristic computer main thread panicked")?;
-
-    Ok(candidates)
+    pub fn portfolio_manager_on_tick(&mut self) {
+        self.intraday
+            .portfolio_manager
+            .optimize_portfolio_if_changed(&self.intraday.last_position_map);
+    }
 }
 
 #[derive(Debug)]

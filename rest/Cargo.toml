@@ -1,0 +1,38 @@
+[package]
+name = "rest"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+common = { path = "../common" }
+entity = { path = "../entity" }
+anyhow = "1.0.58"
+log = "0.4.17"
+serde_json = "1.0.82"
+
+[dependencies.reqwest]
+version = "0.11.11"
+default-features = false
+features = ["rustls-tls-webpki-roots"]
+
+[dependencies.rust_decimal]
+version = "1.25.0"
+default-features = false
+features = ["serde-with-arbitrary-precision"]
+
+[dependencies.serde]
+version = "1.0.140"
+features = ["derive"]
+
+[dependencies.stock-symbol]
+version = "0.3.0"
+features = ["serde"]
+
+[dependencies.time]
+version = "0.3.11"
+features = ["serde"]
+
+[dependencies.tokio]
+version = "1.20.1"
+default-features = false
+features = ["time"]

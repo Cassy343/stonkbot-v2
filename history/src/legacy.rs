@@ -4,22 +4,19 @@ use std::{
 };
 
 use super::LocalHistory;
+use ::entity::data::{Bar, LossyBar};
 use async_trait::async_trait;
-use stock_symbol::Symbol;
-use time::{Date, OffsetDateTime};
-
-use crate::{
-    config::{Config, IndicatorPeriodConfig},
-    entity::data::{Bar, LossyBar},
-    rest::AlpacaRestApi,
-    util::{f64_to_decimal, SECONDS_TO_DAYS},
-};
+use common::config::{Config, IndicatorPeriodConfig};
+use common::util::{f64_to_decimal, SECONDS_TO_DAYS};
 use futures::{executor::block_on, StreamExt};
 use log::{error, info, warn};
+use rest::AlpacaRestApi;
 use sqlx::{
     database::HasArguments, query::Query, sqlite::SqlitePool, Error as SqlxError, Row, Sqlite,
 };
 use std::collections::HashSet;
+use stock_symbol::Symbol;
+use time::{Date, OffsetDateTime};
 
 pub struct SqliteLocalHistory {
     database_file: String,
@@ -842,9 +839,6 @@ impl Drop for SqliteLocalHistory {
 
 // Structs for storing related data together
 mod entity {
-    use serde_json::Value as JsonValue;
-    use std::collections::HashMap;
-
     pub struct IndicatorDataInput {
         pub obv: i64,
         pub adl: i64,
@@ -886,21 +880,6 @@ mod entity {
         pub low: f64,
         pub close: f64,
         pub volume: i64,
-    }
-
-    impl Ohlcv {
-        pub fn from_alpaca_data(map: &HashMap<String, JsonValue>) -> Option<Self> {
-            Some(Ohlcv {
-                open: map.get("o")?.as_f64()?,
-                high: map.get("h")?.as_f64()?,
-                low: map.get("l")?.as_f64()?,
-                close: map.get("c")?.as_f64()?,
-                volume: match map.get("v") {
-                    Some(volume) => volume.as_f64()? as i64,
-                    None => 0,
-                },
-            })
-        }
     }
 }
 

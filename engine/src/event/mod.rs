@@ -9,7 +9,7 @@ use stock_symbol::Symbol;
 use time::{Duration, OffsetDateTime};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
-use crate::entity::data::Bar;
+use entity::data::Bar;
 
 pub struct EventReceiver {
     rx: Receiver<EngineEvent>,

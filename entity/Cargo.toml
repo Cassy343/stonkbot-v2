@@ -1,0 +1,33 @@
+[package]
+name = "entity"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde_json = "1.0.82"
+serde_with = "2.0.0"
+common = { path = "../common" }
+
+[dependencies.rust_decimal]
+version = "1.25.0"
+default-features = false
+features = ["serde-with-arbitrary-precision", "serde-with-float"]
+
+[dependencies.serde]
+version = "1.0.140"
+features = ["derive"]
+
+[dependencies.stock-symbol]
+version = "0.3.0"
+features = ["serde"]
+
+[dependencies.time]
+version = "0.3.11"
+features = [
+    "serde",
+    "serde-well-known"
+]
+
+[dependencies.uuid]
+version = "1.1.2"
+features = ["serde"]
