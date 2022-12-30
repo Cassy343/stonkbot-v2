@@ -24,15 +24,12 @@ use std::{
     sync::Mutex,
     thread,
 };
-use termion::{color, cursor};
 use time::OffsetDateTime;
 
-const FILE_SIZE_LIMIT: u64 = 50_000_000;
+#[cfg(unix)]
+use termion::{color, cursor};
 
-#[cfg(debug_assertions)]
-const LEVEL_FILTER: LevelFilter = LevelFilter::Trace;
-#[cfg(not(debug_assertions))]
-const LEVEL_FILTER: LevelFilter = LevelFilter::Info;
+const FILE_SIZE_LIMIT: u64 = 50_000_000;
 
 macro_rules! format_record {
     ($writer:expr, $record:expr) => {{
@@ -94,7 +91,7 @@ pub fn init_logger<P: ExternalPrinter + Send + 'static>(
             Root::builder()
                 .appender("console")
                 .appender("log_file")
-                .build(LEVEL_FILTER),
+                .build(common::config::Config::get().log_level_filter),
         )?;
 
     log4rs::init_config(config)?;
@@ -149,20 +146,31 @@ struct CustomConsoleAppender<P> {
 impl<P: ExternalPrinter + Send + 'static> Append for CustomConsoleAppender<P> {
     fn append(&self, record: &Record) -> Result<(), anyhow::Error> {
         let mut writer = Cursor::new(Vec::<u8>::new());
-        write!(writer, "{}", cursor::Up(1))?;
-        match record.metadata().level() {
-            Level::Error => write!(writer, "{}", color::Fg(color::Red))?,
-            Level::Warn => write!(writer, "{}", color::Fg(color::LightYellow))?,
-            Level::Debug => write!(writer, "{}", color::Fg(color::LightCyan))?,
-            Level::Trace => write!(writer, "{}", color::Fg(color::LightMagenta))?,
-            _ => write!(writer, "{}", color::Fg(color::Reset))?,
+
+        #[cfg(unix)]
+        {
+            write!(writer, "{}", cursor::Up(1))?;
+            match record.metadata().level() {
+                Level::Error => write!(writer, "{}", color::Fg(color::Red))?,
+                Level::Warn => write!(writer, "{}", color::Fg(color::LightYellow))?,
+                Level::Debug => write!(writer, "{}", color::Fg(color::LightCyan))?,
+                Level::Trace => write!(writer, "{}", color::Fg(color::LightMagenta))?,
+                _ => write!(writer, "{}", color::Fg(color::Reset))?,
+            }
         }
+
         format_record!(&mut writer, record)?;
-        writeln!(writer, "{}", color::Fg(color::Reset))?;
+
+        #[cfg(unix)]
+        {
+            writeln!(writer, "{}", color::Fg(color::Reset))?;
+        }
+
         self.printer.lock().unwrap().print(
             String::from_utf8(writer.into_inner())
                 .unwrap_or_else(|error| format!("failed to format string: {error}")),
         )?;
+
         Ok(())
     }
 

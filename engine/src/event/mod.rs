@@ -87,6 +87,9 @@ impl From<StreamEvent> for EngineEvent {
 
 #[derive(Debug)]
 pub enum Command {
+    CurrentTrackedSymbols,
+    EngineDump,
+    PriceInfo { symbol: Symbol },
     Status,
     Stop,
     UpdateHistory { max_updates: Option<NonZeroUsize> },

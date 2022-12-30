@@ -12,12 +12,6 @@ use rustyline::Editor;
 use std::panic::{self, AssertUnwindSafe};
 use tokio::{runtime::Builder, task};
 
-/*
-TODO:
- - log which symbols we're tracking for the day
- - add command to query symbol info
-*/
-
 fn main() {
     if let Err(error) = setup_and_launch() {
         println!("{error:?}");

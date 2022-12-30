@@ -7,7 +7,7 @@ use futures::{
     stream::{SplitSink, SplitStream},
     Future, SinkExt, StreamExt,
 };
-use log::{error, warn};
+use log::{debug, error, warn};
 use std::{
     borrow::Cow,
     collections::{BTreeSet, HashSet},
@@ -209,6 +209,8 @@ async fn handle_request(stream: &mut Stream, request: StreamRequest) {
                 warn!("Received redundant request to open WebSocket stream on already open stream");
                 return;
             }
+
+            stream.state = StreamState::Opening;
         }
         StreamRequest::SubscribeBars(bars) => {
             stream.expected_sub_state.add_bars(bars);
@@ -304,6 +306,8 @@ async fn check_timeout(stream: &mut Stream) {
 }
 
 async fn connect(endpoint: &str) -> Result<WebSocket, anyhow::Error> {
+    debug!("Connecting stream");
+
     let config = Config::get();
 
     // Open the connection and obtain the socket
@@ -409,21 +413,23 @@ async fn handle_socket(
     while let Some(message_result) = socket.next().await {
         match message_result {
             Ok(Message::Text(json)) => {
-                let message = match serde_json::from_str::<StreamMessage>(&json) {
-                    Ok(message) => message,
+                let messages = match serde_json::from_str::<Vec<StreamMessage>>(&json) {
+                    Ok(messages) => messages,
                     Err(error) => {
-                        warn!("Received malformed incoming message: {error:?}");
+                        warn!("Received malformed incoming message: {error:?}. Raw:\n{json}");
                         continue;
                     }
                 };
 
-                send!(
-                    incoming_event_sender,
-                    IncomingEvent::Message {
-                        message,
-                        epoch: connection_epoch
-                    }
-                );
+                for message in messages {
+                    send!(
+                        incoming_event_sender,
+                        IncomingEvent::Message {
+                            message,
+                            epoch: connection_epoch
+                        }
+                    );
+                }
             }
             Ok(Message::Pong(_)) => {
                 // TODO: maybe validate data?
@@ -501,6 +507,7 @@ enum IncomingEvent {
 pub enum StreamRequest {
     Open,
     SubscribeBars(Vec<Symbol>),
+    #[allow(dead_code)]
     UnsubscribeBars(Vec<Symbol>),
     Close,
 }

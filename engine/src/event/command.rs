@@ -1,3 +1,4 @@
+use std::array;
 use std::{num::NonZeroUsize, time::Duration};
 
 use crate::event::{Command, EventEmitter};
@@ -5,6 +6,7 @@ use common::config::Config;
 use log::error;
 use rustyline::error::ReadlineError;
 use rustyline::Editor;
+use stock_symbol::Symbol;
 use time::UtcOffset;
 use tokio::task;
 
@@ -82,6 +84,9 @@ fn parse_command(input: &str) -> Option<Command> {
     let args = components.collect::<Vec<_>>();
 
     match command {
+        "cts" => Some(Command::CurrentTrackedSymbols),
+        "engdump" | "engine-dump" => Some(Command::EngineDump),
+        "pi" | "price-info" => price_info(&args),
         "status" => Some(Command::Status),
         "stop" => Some(Command::Stop),
         "suo" | "set-utc-offset" => set_utc_offset(&args),
@@ -91,6 +96,26 @@ fn parse_command(input: &str) -> Option<Command> {
             None
         }
     }
+}
+
+fn price_info(args: &[&str]) -> Option<Command> {
+    let symbol = match args.first() {
+        Some(&arg) => arg,
+        None => {
+            println!("Missing argument <symbol>. Usage: price-info <symbol>");
+            return None;
+        }
+    };
+
+    let symbol = match Symbol::from_str(symbol) {
+        Ok(symbol) => symbol,
+        Err(error) => {
+            println!("Invalid symbol: {error}");
+            return None;
+        }
+    };
+
+    Some(Command::PriceInfo { symbol })
 }
 
 fn set_utc_offset(args: &[&str]) -> Option<Command> {
@@ -103,8 +128,7 @@ fn set_utc_offset(args: &[&str]) -> Option<Command> {
     };
 
     let mut time_components = offset_str.split(':');
-    // FIXME: replace with from_fn in 1.63
-    let [h, m, s] = [(); 3].map(|_| {
+    let [h, m, s] = array::from_fn(|_| {
         time_components
             .next()
             .and_then(|component| component.parse::<i8>().ok())

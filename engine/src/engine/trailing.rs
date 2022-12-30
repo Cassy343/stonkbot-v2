@@ -1,10 +1,13 @@
 use std::collections::{hash_map::Entry, HashMap};
 
+use common::util::decimal_to_f64;
 use entity::data::Bar;
 use rust_decimal::Decimal;
+use serde::Serialize;
 use stock_symbol::Symbol;
-use time::{Duration, Time};
+use time::{Duration, OffsetDateTime, Time};
 
+#[derive(Serialize)]
 pub struct PriceTracker {
     stocks: HashMap<Symbol, TrackedStock>,
 }
@@ -16,14 +19,24 @@ impl PriceTracker {
         }
     }
 
-    pub fn record_price(&mut self, symbol: Symbol, bar: Bar) -> Option<PriceInfo> {
+    pub fn tracked_symbols(&self) -> impl Iterator<Item = Symbol> + '_ {
+        self.stocks.keys().copied()
+    }
+
+    pub fn price_info(&self, symbol: Symbol) -> Option<PriceInfo> {
+        self.stocks
+            .get(&symbol)
+            .and_then(|stock| stock.compute_price_info(OffsetDateTime::now_utc().time()))
+    }
+
+    pub fn record_price(&mut self, symbol: Symbol, avg_span: f64, bar: Bar) -> Option<PriceInfo> {
         let price = (bar.high + bar.low) / Decimal::TWO;
         let time = bar.time.time();
 
         match self.stocks.entry(symbol) {
             Entry::Occupied(mut entry) => Some(entry.get_mut().record_price(price, time)),
             Entry::Vacant(entry) => {
-                entry.insert(TrackedStock::new(price, time));
+                entry.insert(TrackedStock::new(price, avg_span, time));
                 None
             }
         }
@@ -34,26 +47,43 @@ impl PriceTracker {
     }
 }
 
+#[derive(Serialize)]
 struct TrackedStock {
     last_hwm: usize,
     last_lwm: usize,
+    max_step: f64,
     prices: Vec<RecordedPrice>,
 }
 
 impl TrackedStock {
-    fn new(initial_price: Decimal, initial_time: Time) -> Self {
+    fn new(initial_price: Decimal, avg_span: f64, initial_time: Time) -> Self {
         Self {
             last_hwm: 0,
             last_lwm: 0,
+            max_step: f64::powf(1.0 + avg_span, 1.0 / 150.0) - 1.0,
             prices: vec![RecordedPrice {
                 price: initial_price,
+                non_volatile_price: decimal_to_f64(initial_price),
                 time: initial_time,
             }],
         }
     }
 
     fn record_price(&mut self, price: Decimal, time: Time) -> PriceInfo {
-        self.prices.push(RecordedPrice { price, time });
+        let last_non_volatile_price = self.prices.last().unwrap().non_volatile_price;
+        let f64_price = decimal_to_f64(price);
+
+        let non_volatile_price = if f64_price > last_non_volatile_price {
+            f64::min(last_non_volatile_price * (1.0 + self.max_step), f64_price)
+        } else {
+            f64::max(last_non_volatile_price * (1.0 - self.max_step), f64_price)
+        };
+
+        self.prices.push(RecordedPrice {
+            price,
+            non_volatile_price,
+            time,
+        });
 
         if price > self.prices[self.last_hwm].price {
             self.last_hwm = self.prices.len() - 1;
@@ -63,36 +93,46 @@ impl TrackedStock {
             self.last_lwm = self.prices.len() - 1;
         }
 
+        // Unwrap is safe because we push to prices at the beginning of the function, and we know
+        // there's at least one recorded price by the impl of TrackedStock::new
+        self.compute_price_info(time).unwrap()
+    }
+
+    fn compute_price_info(&self, time: Time) -> Option<PriceInfo> {
+        if self.prices.len() < 2 {
+            return None;
+        }
+
+        let last_rec_price = self.prices.last()?;
+        let non_volatile_price = last_rec_price.non_volatile_price;
         let hwm = self.prices[self.last_hwm];
         let lwm = self.prices[self.last_lwm];
+        let hwm_price = decimal_to_f64(hwm.price);
+        let lwm_price = decimal_to_f64(lwm.price);
 
-        let avg_seconds_per_record = self
-            .prices
-            .windows(2)
-            .map(|window| (window[1].time - window[0].time).whole_seconds())
-            .sum::<i64>()
-            / (self.prices.len() - 1) as i64;
-
-        PriceInfo {
-            hwm_loss: (price - hwm.price) / hwm.price,
+        Some(PriceInfo {
+            latest_price: last_rec_price.price,
+            non_volatile_price,
+            hwm_loss: (non_volatile_price - hwm_price) / hwm_price,
             time_since_hwm: time - hwm.time,
-            lwm_gain: (price - lwm.price) / lwm.price,
+            lwm_gain: (non_volatile_price - lwm_price) / lwm_price,
             time_since_lwm: time - lwm.time,
-            avg_seconds_per_record,
-        }
+        })
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Serialize)]
 struct RecordedPrice {
     price: Decimal,
+    non_volatile_price: f64,
     time: Time,
 }
 
 pub struct PriceInfo {
-    pub hwm_loss: Decimal,
+    pub latest_price: Decimal,
+    pub non_volatile_price: f64,
+    pub hwm_loss: f64,
     pub time_since_hwm: Duration,
-    pub lwm_gain: Decimal,
+    pub lwm_gain: f64,
     pub time_since_lwm: Duration,
-    pub avg_seconds_per_record: i64,
 }

@@ -1002,6 +1002,15 @@ impl LocalHistory for SqliteLocalHistory {
         Ok(result)
     }
 
+    async fn get_symbol_avg_span(&self, symbol: Symbol) -> anyhow::Result<f64> {
+        sqlx::query_as::<_, (f64,)>("SELECT avg_span FROM CS_Metadata WHERE symbol = ?")
+            .bind(symbol.as_str())
+            .fetch_one(&self.connection_pool)
+            .await
+            .map(|(span,)| span)
+            .map_err(Into::into)
+    }
+
     async fn refresh_connection(&mut self) -> anyhow::Result<()> {
         self.connection_pool.close().await;
         self.connection_pool = SqlitePool::connect(&self.database_file).await?;

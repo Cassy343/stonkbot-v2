@@ -1,5 +1,3 @@
-use log::trace;
-
 const EPSILON: f64 = 1e-7;
 
 pub fn compute_kelly_bet(returns: &[f64], probabilities: &[f64]) -> f64 {
@@ -75,22 +73,19 @@ where
         .sum::<f64>()
 }
 
-pub fn optimize_portfolio<T>(
-    positions: usize,
-    returns: &[T],
-    probabilities: &[f64],
-) -> OptimizedPortfolio
+pub fn optimize_portfolio<T>(positions: usize, returns: &[T], probabilities: &[f64]) -> Vec<f64>
 where
     T: AsRef<[f64]>,
 {
-    const MAX_ITERS: i32 = 65536;
+    // TODO: re-tune this
+    const MAX_ITERS: i32 = 2 << 18;
 
     let mut step = f64::sqrt(positions as f64) / 10.0;
     let mut fractions = vec![0.0; positions];
     let mut prev_exp_return = f64::MIN;
     let mut grad = vec![0.0; positions];
 
-    for i in 0..MAX_ITERS {
+    for _i in 0..MAX_ITERS {
         // Compute the gradient and expected return
         let exp_return = returns
             .iter()
@@ -135,7 +130,7 @@ where
             .sqrt();
 
         if norm < EPSILON {
-            trace!("Iterations: {i}");
+            // trace!("Iterations: {i}");
             break;
         }
 
@@ -147,18 +142,10 @@ where
             *g = 0.0;
         });
 
-        if i == MAX_ITERS - 1 {
-            trace!("Iterations maxed out");
-        }
+        // if i == MAX_ITERS - 1 {
+        //     trace!("Iterations maxed out");
+        // }
     }
 
-    OptimizedPortfolio {
-        fractions,
-        expected_return: prev_exp_return,
-    }
-}
-
-pub struct OptimizedPortfolio {
-    pub fractions: Vec<f64>,
-    pub expected_return: f64,
+    fractions
 }

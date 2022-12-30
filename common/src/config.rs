@@ -1,4 +1,6 @@
+use crate::util::SerdeLevelFilter;
 use anyhow::{anyhow, Context};
+use log::LevelFilter;
 use once_cell::sync::OnceCell;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -27,7 +29,7 @@ pub struct Config {
     pub indicator_periods: IndicatorPeriodConfig,
     pub utc_offset: LocalOffset,
     pub force_open: bool,
-    pub qp_solver: Option<String>,
+    pub log_level_filter: LevelFilter,
 }
 
 impl Config {
@@ -99,7 +101,7 @@ impl Config {
             indicator_periods: on_disk_config.indicator_periods,
             utc_offset,
             force_open,
-            qp_solver: on_disk_config.qp_solver,
+            log_level_filter: on_disk_config.log_level_filter,
         };
 
         GLOBAL_CONFIG
@@ -277,15 +279,15 @@ impl Default for IndicatorPeriodConfig {
     }
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize)]
 struct OnDiskConfig {
     urls: Urls,
     trading: TradingConfig,
     indicator_periods: IndicatorPeriodConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     utc_offset: Option<LocalOffset>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    qp_solver: Option<String>,
+    #[serde(with = "SerdeLevelFilter")]
+    log_level_filter: LevelFilter,
 }
 
 impl OnDiskConfig {
@@ -295,5 +297,17 @@ impl OnDiskConfig {
             serde_json::to_string_pretty(&default).expect("Failed to serialize on-disk config");
 
         (default, serialized)
+    }
+}
+
+impl Default for OnDiskConfig {
+    fn default() -> Self {
+        Self {
+            urls: Urls::default(),
+            trading: TradingConfig::default(),
+            indicator_periods: IndicatorPeriodConfig::default(),
+            utc_offset: None,
+            log_level_filter: LevelFilter::Trace,
+        }
     }
 }

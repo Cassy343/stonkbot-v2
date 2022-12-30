@@ -17,6 +17,7 @@ use time::format_description::well_known::Rfc3339;
 use time::Duration;
 use time::OffsetDateTime;
 use tokio::time::sleep;
+use uuid::Uuid;
 
 const KEY_ID_HEADER: &str = "APCA-API-KEY-ID";
 const SECRET_KEY_HEADER: &str = "APCA-API-SECRET-KEY";
@@ -131,6 +132,11 @@ impl AlpacaRestApi {
                 .body(serde_json::to_string(order)?.into_bytes()),
         )
         .await
+    }
+
+    pub async fn get_order(&self, id: Uuid) -> anyhow::Result<Order> {
+        Self::send(self.trading_endpoint(Method::GET, &format!("/orders/{}", id.hyphenated())))
+            .await
     }
 
     pub async fn day_bar<B: DeserializeOwned>(

@@ -27,5 +27,7 @@ pub trait LocalHistory: Send + Sync + 'static {
         end: Option<OffsetDateTime>,
     ) -> anyhow::Result<Vec<Bar>>;
 
+    async fn get_symbol_avg_span(&self, symbol: Symbol) -> anyhow::Result<f64>;
+
     async fn refresh_connection(&mut self) -> anyhow::Result<()>;
 }

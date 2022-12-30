@@ -9,7 +9,7 @@ use time::serde::rfc3339;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Account {
     pub id: Uuid,
     pub account_number: String,
@@ -40,7 +40,7 @@ pub struct Account {
     pub regt_buying_power: Decimal,
 }
 
-#[derive(Deserialize, PartialEq, Eq, Debug)]
+#[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum AccountStatus {
     Onboarding,
@@ -97,7 +97,7 @@ impl Display for AssetStatus {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct Position {
     pub asset_id: Uuid,
     pub symbol: Symbol,
@@ -156,6 +156,12 @@ pub enum OrderStatus {
     Rejected,
     Suspended,
     Calculated,
+}
+
+impl OrderStatus {
+    pub fn is_closed(&self) -> bool {
+        matches!(self, Self::Filled | Self::Canceled | Self::Expired)
+    }
 }
 
 #[derive(PartialEq, Eq, Serialize, Deserialize)]

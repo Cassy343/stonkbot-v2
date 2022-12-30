@@ -5,7 +5,7 @@ use std::{
     str::FromStr,
 };
 
-use log::warn;
+use log::{warn, LevelFilter};
 use num_traits::ToPrimitive;
 use once_cell::sync::Lazy;
 use rust_decimal::{prelude::FromPrimitive, Decimal};
@@ -175,4 +175,15 @@ impl Ord for TotalF64 {
     fn cmp(&self, other: &Self) -> Ordering {
         f64::total_cmp(&self.0, &other.0)
     }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(remote = "LevelFilter")]
+pub enum SerdeLevelFilter {
+    Off,
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
 }

@@ -2,7 +2,7 @@ use std::{collections::HashMap, path::Path};
 
 use anyhow::anyhow;
 use entity::trading::Position;
-use log::debug;
+use log::{debug, trace};
 use num_traits::FromPrimitive;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -19,6 +19,7 @@ use anyhow::Context;
 
 const METADATA_FILE: &str = "position-metadata.json";
 
+#[derive(Serialize)]
 pub struct PositionManager {
     position_meta: HashMap<Symbol, PositionMetadata>,
 }
@@ -68,28 +69,9 @@ impl PositionManager {
 
         Ok(())
     }
-
-    fn compute_additional_shares(
-        meta: &PositionMetadata,
-        position: &Position,
-        total_available_cash: Decimal,
-    ) -> Decimal {
-        let expected_next_price = position.current_price * meta.expected_positive_return;
-        let additional_shares = (meta.cost_basis + meta.debt - expected_next_price * position.qty)
-            / (expected_next_price - position.current_price);
-
-        if additional_shares.is_sign_positive() {
-            Decimal::min(
-                total_available_cash / position.current_price,
-                additional_shares,
-            )
-        } else {
-            -Decimal::min(position.qty - meta.initial_qty, additional_shares.abs())
-        }
-    }
 }
 
-impl<H: LocalHistory> Engine<H> {
+impl Engine {
     pub async fn position_manager_on_pre_open(&mut self) -> anyhow::Result<()> {
         debug!("Running position manager pre-open tasks");
 
@@ -168,6 +150,26 @@ impl<H: LocalHistory> Engine<H> {
             .await;
     }
 
+    pub async fn position_manager_on_tick(&mut self) -> anyhow::Result<()> {
+        match self.clock_info.duration_until_close {
+            Some(duration) if duration <= Duration::minutes(10) => {
+                let symbols = self
+                    .intraday
+                    .last_position_map
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>();
+                for symbol in symbols {
+                    self.position_sell_trigger(symbol).await?;
+                    self.position_buy_trigger(symbol).await?;
+                }
+            }
+            _ => (),
+        }
+
+        Ok(())
+    }
+
     pub async fn position_sell_trigger(&mut self, symbol: Symbol) -> anyhow::Result<()> {
         // If selling would count as a day trade, then don't sell
         if !self
@@ -176,29 +178,31 @@ impl<H: LocalHistory> Engine<H> {
             .trade_status(symbol)
             .is_sell_daytrade_safe()
         {
+            trace!("Trigger for {symbol} ignored due to trade status");
             return Ok(());
         }
 
         // Make sure the symbol is actually a position we hold
         let position = match self.intraday.last_position_map.get(&symbol) {
             Some(pos) => pos,
-            None => return Ok(()),
+            None => {
+                trace!("Trigger for {symbol} ignored; no currently held position");
+                return Ok(());
+            }
         };
 
-        // If we've made a profit then just sell it all
-        if position.unrealized_plpc.is_sign_positive() {
-            return self.intraday.order_manager.liquidate(symbol).await;
-        }
-
-        let optimal_equity = self
-            .portfolio_manager_optimal_equity(symbol)
-            .ok_or_else(|| anyhow!("Currently held position in {symbol} not in portfolio"))?;
+        let optimal_equity = self.portfolio_manager_optimal_equity(symbol);
         let current_equity = position.market_value;
 
         let surplus = current_equity - optimal_equity;
         if surplus <= Decimal::ONE {
+            trace!(
+                "Trigger for {symbol} ignored; surplus amount {surplus:.2} is less than threshold"
+            );
             return Ok(());
         }
+
+        debug!("Selling ${surplus:.2} of {symbol}. Optimal equity: {optimal_equity:.2}, current equity: {current_equity:.2}");
 
         let qty = surplus / position.current_price;
         self.intraday.order_manager.sell(symbol, qty).await?;
@@ -213,6 +217,7 @@ impl<H: LocalHistory> Engine<H> {
             .trade_status(symbol)
             .is_buy_daytrade_safe()
         {
+            trace!("Trigger for {symbol} ignored due to trade status");
             return Ok(());
         }
 
@@ -222,12 +227,13 @@ impl<H: LocalHistory> Engine<H> {
 
         let position = match self.intraday.last_position_map.get(&symbol) {
             Some(pos) => pos,
-            None => return Ok(()),
+            None => {
+                trace!("Trigger for {symbol} ignored; no currently held position");
+                return Ok(());
+            }
         };
 
-        let optimal_equity = self
-            .portfolio_manager_optimal_equity(symbol)
-            .ok_or_else(|| anyhow!("Currently held position in {symbol} not in portfolio"))?;
+        let optimal_equity = self.portfolio_manager_optimal_equity(symbol);
         let current_equity = position.market_value;
 
         let deficit = optimal_equity - current_equity;
@@ -235,9 +241,11 @@ impl<H: LocalHistory> Engine<H> {
         let notional = Decimal::min(deficit, cash);
 
         if notional <= Decimal::ONE {
+            trace!("Trigger for {symbol} ignored; notional amount {notional:.2} is less than threshold");
             return Ok(());
         }
 
+        debug!("Buying ${notional:.2} of {symbol}. Optimal equity: {optimal_equity:.2}, current equity: {current_equity:.2}");
         self.intraday.order_manager.buy(symbol, notional).await?;
 
         Ok(())
