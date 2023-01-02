@@ -9,7 +9,11 @@ use crate::event::{
     stream::{StreamRequest, StreamRequestSender},
     ClockEvent, Command, EngineEvent, EventReceiver, StreamEvent,
 };
-use entity::trading::{Account, Position};
+use common::config::Config;
+use entity::{
+    data::Bar,
+    trading::{Account, AssetStatus, Position},
+};
 use history::{self, LocalHistory, LocalHistoryImpl};
 use log::{debug, error, info, log, trace, warn, Level};
 use rest::AlpacaRestApi;
@@ -319,6 +323,20 @@ impl Engine {
 
                 Self::log_price_info(symbol, &price_info, Level::Info);
             }
+            Command::RunPreOpen => {
+                if let Err(error) = self.on_pre_open().await {
+                    error!("Failed to run pre-open: {error:?}");
+                }
+            }
+            Command::RepairRecords { symbols } => {
+                if let Err(error) = self
+                    .local_history
+                    .repair_records(&self.rest, &symbols)
+                    .await
+                {
+                    error!("Failed to repair records: {error:?}");
+                }
+            }
             Command::Status => {
                 if let Err(error) = self.log_status().await {
                     error!("Failed to log status: {:?}", error);
@@ -336,6 +354,98 @@ impl Engine {
                         error!("Failed to update database history: {error:?}");
                     }
                 });
+            }
+            Command::UntrackedSymbols => {
+                let equities = match self.rest.us_equities().await {
+                    Ok(e) => e,
+                    Err(error) => {
+                        error!("Failed to fetch equities: {error:?}");
+                        return;
+                    }
+                };
+
+                let local_symbols = match self.local_history.symbols().await {
+                    Ok(s) => s,
+                    Err(error) => {
+                        error!("Failed to fetch list of local symbols: {error:?}");
+                        return;
+                    }
+                };
+
+                let untracked_equities = equities
+                    .into_iter()
+                    .flat_map(|asset| asset.symbol.to_compact().map(|symbol| (symbol, asset)))
+                    .filter(|(symbol, asset)| {
+                        asset.tradable
+                            && asset.fractionable
+                            && asset.status == AssetStatus::Active
+                            && !local_symbols.contains(symbol)
+                    })
+                    .map(|(symbol, _)| symbol)
+                    .collect::<Vec<_>>();
+
+                let mut start = OffsetDateTime::now_utc() - Duration::days(1);
+                let mut history = None;
+
+                for _ in 0..5 {
+                    let hist = match self
+                        .rest
+                        .history::<Bar>(untracked_equities.iter().copied(), start, None)
+                        .await
+                    {
+                        Ok(hist) => hist,
+                        Err(error) => {
+                            error!("Failed to fetch history: {error:?}");
+                            continue;
+                        }
+                    };
+
+                    let count = hist.iter().filter(|(_, bars)| !bars.is_empty()).count();
+
+                    if count < untracked_equities.len() / 2 {
+                        start -= Duration::days(1);
+                        continue;
+                    }
+
+                    history = Some(hist);
+                    break;
+                }
+
+                let min_median_volume = Config::get().trading.minimum_median_volume;
+
+                let symbols = match history {
+                    Some(history) => untracked_equities
+                        .into_iter()
+                        .filter(|symbol| {
+                            history
+                                .get(symbol)
+                                .map(|bars| bars.last())
+                                .flatten()
+                                .map(|bar| bar.volume >= min_median_volume)
+                                .unwrap_or(false)
+                        })
+                        .collect::<Vec<_>>(),
+                    None => {
+                        warn!("Could not fetch history for untracked equities. Using unfiltered list.");
+                        untracked_equities
+                    }
+                };
+
+                let mut iter = symbols.into_iter();
+                let mut uts_string = match iter.next() {
+                    Some(symbol) => symbol.to_string(),
+                    None => {
+                        info!("No viable untracked symbols");
+                        return;
+                    }
+                };
+
+                iter.for_each(|symbol| {
+                    uts_string.push_str(", ");
+                    uts_string.push_str(symbol.as_str())
+                });
+
+                info!("Untracked symbols: {uts_string}")
             }
             Command::Stop => {
                 warn!(

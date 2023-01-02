@@ -1,5 +1,8 @@
 use async_trait::async_trait;
-use std::{collections::HashMap, num::NonZeroUsize};
+use std::{
+    collections::{HashMap, HashSet},
+    num::NonZeroUsize,
+};
 use stock_symbol::Symbol;
 use time::OffsetDateTime;
 
@@ -8,11 +11,15 @@ use rest::AlpacaRestApi;
 
 #[async_trait]
 pub trait LocalHistory: Send + Sync + 'static {
+    async fn symbols(&self) -> anyhow::Result<HashSet<Symbol>>;
+
     async fn update_history_to_present(
         &self,
         rest: &AlpacaRestApi,
         max_updates: Option<NonZeroUsize>,
     ) -> anyhow::Result<()>;
+
+    async fn repair_records(&self, rest: &AlpacaRestApi, symbols: &[Symbol]) -> anyhow::Result<()>;
 
     async fn get_market_history(
         &self,

@@ -1,6 +1,6 @@
 use std::{
-    collections::{btree_map::Entry, BTreeMap, HashMap},
-    time::Instant,
+    cmp::Reverse,
+    collections::{BTreeMap, HashMap},
 };
 
 use crate::engine::kelly;
@@ -13,11 +13,9 @@ use entity::{
 };
 use history::LocalHistory;
 use log::{debug, error};
-use rand::{thread_rng, Rng};
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 use rust_decimal::Decimal;
 use serde::Serialize;
-use std::ops::Bound::{Included, Unbounded};
 use stock_symbol::Symbol;
 use time::{Duration, OffsetDateTime};
 use tokio::task;
@@ -26,9 +24,6 @@ use super::{engine_impl::Engine, kelly::compute_kelly_bet};
 
 #[derive(Serialize)]
 pub struct PortfolioManager {
-    #[serde(skip)]
-    kelly_indexed_candidates: BTreeMap<TotalF64, usize>,
-    candidates_max_key: f64,
     #[serde(skip)]
     symbol_indexed_candidates: HashMap<Symbol, usize>,
     candidates: Vec<Candidate>,
@@ -39,15 +34,13 @@ pub struct PortfolioManager {
 
 #[derive(Default)]
 struct ExpectationMatrices {
-    returns: Vec<Vec<f64>>,
+    returns: Vec<f64>,
     probabilities: Vec<f64>,
 }
 
 impl PortfolioManager {
     pub fn new() -> Self {
         Self {
-            kelly_indexed_candidates: BTreeMap::new(),
-            candidates_max_key: 0.0,
             symbol_indexed_candidates: HashMap::new(),
             candidates: Vec::new(),
             position_hist_returns: HashMap::new(),
@@ -61,13 +54,6 @@ impl PortfolioManager {
 
     pub fn candidates(&self) -> &[Candidate] {
         &self.candidates
-    }
-
-    fn candidate_by_kelly(&self, kelly_index: TotalF64) -> Option<&Candidate> {
-        self.kelly_indexed_candidates
-            .range((Unbounded, Included(kelly_index)))
-            .next_back()
-            .map(|(_, &i)| &self.candidates[i])
     }
 
     fn candidate_by_symbol(&self, symbol: Symbol) -> Option<&Candidate> {
@@ -86,31 +72,28 @@ impl PortfolioManager {
             })
     }
 
-    fn optimize_portfolio(
-        &mut self,
-        account_equity: Decimal,
-        positions: &HashMap<Symbol, Position>,
-    ) {
+    fn optimize_portfolio(&mut self, positions: &HashMap<Symbol, Position>) {
         debug!("Optimizing portfolio");
         let mut best_portfolio = BTreeMap::new();
         let mut best_exp_return = f64::MIN;
-        let start = Instant::now();
 
         if !positions.is_empty() {
-            best_portfolio.extend(positions.iter().map(|(&symbol, position)| {
-                (
-                    symbol,
-                    decimal_to_f64(position.market_value / account_equity),
-                )
-            }));
+            best_portfolio.extend(positions.iter().map(|(&symbol, _)| (symbol, 0.0)));
             let ExpectationMatrices {
                 returns,
                 probabilities,
             } = self.generate_expectation_matrices(&best_portfolio);
-            let fractions = best_portfolio.values().copied().collect::<Vec<_>>();
+            let mut fractions =
+                kelly::optimize_portfolio(best_portfolio.len(), &returns, &probabilities);
+            let total = fractions.iter().sum::<f64>();
+            fractions.iter_mut().for_each(|f| *f /= total);
             best_exp_return =
                 kelly::expected_log_portfolio_return(&fractions, &returns, &probabilities);
             debug!("Current positions expected return: {best_exp_return}");
+            best_portfolio
+                .values_mut()
+                .zip(fractions)
+                .for_each(|(f, f_star)| *f = f_star);
         }
 
         if !self.portfolio.is_empty() {
@@ -128,37 +111,52 @@ impl PortfolioManager {
             }
         }
 
-        loop {
-            self.select_random_portfolio();
-            let ExpectationMatrices {
-                returns,
-                probabilities,
-            } = self.generate_expectation_matrices(&self.portfolio);
-            let mut fractions =
-                kelly::optimize_portfolio(self.portfolio.len(), &returns, &probabilities);
-            let total = fractions.iter().sum::<f64>();
-            fractions.iter_mut().for_each(|f| *f /= total);
-            let expected_return =
-                kelly::expected_log_portfolio_return(&fractions, &returns, &probabilities);
-            // trace!("{expected_return}");
-            self.portfolio
-                .values_mut()
-                .zip(fractions)
-                .for_each(|(f, f_star)| *f = f_star);
+        let mut candidates = self
+            .candidates
+            .iter()
+            .map(|candidate| (candidate, 0.0f64))
+            .collect::<Vec<_>>();
+        let max_position_count = Config::get().trading.max_position_count;
 
-            if expected_return > best_exp_return {
-                best_portfolio = self.portfolio.clone();
-                best_exp_return = expected_return;
+        for _ in 0..100 {
+            for chunk in candidates.chunks_mut(max_position_count) {
+                self.portfolio.clear();
+                self.portfolio
+                    .extend(chunk.iter().map(|(candidate, _)| (candidate.symbol, 0.0)));
+                let ExpectationMatrices {
+                    returns,
+                    probabilities,
+                } = self.generate_expectation_matrices(&self.portfolio);
+                let mut fractions =
+                    kelly::optimize_portfolio(self.portfolio.len(), &returns, &probabilities);
+                let total = fractions.iter().sum::<f64>();
+                fractions.iter_mut().for_each(|f| *f /= total);
+                let expected_return =
+                    kelly::expected_log_portfolio_return(&fractions, &returns, &probabilities);
+                self.portfolio
+                    .values_mut()
+                    .zip(fractions)
+                    .for_each(|(f, f_opt)| *f = f_opt);
+                chunk.iter_mut().for_each(|(candidate, f)| {
+                    *f = *self.portfolio.get(&candidate.symbol).unwrap()
+                });
+
+                if expected_return > best_exp_return {
+                    best_portfolio = self.portfolio.clone();
+                    best_exp_return = expected_return;
+                }
             }
 
-            if start.elapsed() > std::time::Duration::from_secs(15) {
+            if candidates.len() <= max_position_count {
                 break;
             }
+
+            candidates.sort_unstable_by_key(|(_, f)| Reverse(TotalF64(*f)));
         }
 
         best_portfolio.retain(|k, &mut v| positions.contains_key(k) || v > 0.0);
 
-        debug!("Optimized portfolio (exp. return: {best_exp_return:.3}). Selected portfolio:\n{best_portfolio:#?}");
+        debug!("Optimized portfolio (exp. return: {best_exp_return}). Selected portfolio:\n{best_portfolio:#?}");
 
         self.portfolio = best_portfolio;
         self.portfolio.keys().for_each(|&symbol| {
@@ -168,34 +166,6 @@ impl PortfolioManager {
                 returns.iter().sum::<f64>() / returns.len() as f64
             )
         });
-    }
-
-    fn select_random_portfolio(&mut self) {
-        self.portfolio.clear();
-        let num_positions = Config::get().trading.max_position_count;
-
-        if self.portfolio.len() < num_positions {
-            if self.portfolio.len() + self.candidates.len() <= num_positions {
-                self.portfolio.extend(
-                    self.candidates
-                        .iter()
-                        .map(|candidate| (candidate.symbol, 0.0)),
-                );
-            } else {
-                let mut rng = thread_rng();
-                let max = self.candidates_max_key;
-
-                while self.portfolio.len() < num_positions {
-                    let key = TotalF64(rng.gen::<f64>() * max);
-                    let selection = self
-                        .candidate_by_kelly(key)
-                        .expect("random key out of range");
-                    if let Entry::Vacant(entry) = self.portfolio.entry(selection.symbol) {
-                        entry.insert(0.0);
-                    }
-                }
-            }
-        }
     }
 
     fn generate_expectation_matrices(
@@ -216,11 +186,10 @@ impl PortfolioManager {
         let probabilities = vec![1.0 / (n as f64); n];
 
         let returns = (0..n)
-            .map(|i| {
+            .flat_map(|i| {
                 portfolio
                     .keys()
-                    .map(|&symbol| self.get_returns(symbol).expect(NO_DATA_MSG)[i])
-                    .collect::<Vec<_>>()
+                    .map(move |&symbol| self.get_returns(symbol).expect(NO_DATA_MSG)[i])
             })
             .collect::<Vec<_>>();
 
@@ -324,21 +293,15 @@ impl Engine {
 
         let pm = &mut self.intraday.portfolio_manager;
 
-        pm.kelly_indexed_candidates.clear();
         pm.symbol_indexed_candidates.clear();
 
-        let mut sum = 0.0;
         for (i, candidate) in candidates.iter().enumerate() {
-            let kelly_bet = candidate.kelly_bet;
-            pm.kelly_indexed_candidates.insert(TotalF64(sum), i);
             pm.symbol_indexed_candidates.insert(candidate.symbol, i);
-            sum += kelly_bet;
         }
 
-        pm.candidates_max_key = sum;
         pm.candidates = candidates;
 
-        pm.optimize_portfolio(self.intraday.last_account.equity, positions);
+        pm.optimize_portfolio(positions);
 
         Ok(())
     }
@@ -377,9 +340,8 @@ fn compute_candidate(
     }
 
     let returns = sanitized_returns(&bars);
-    let probabilities = vec![1.0 / (returns.len() as f64); returns.len()];
 
-    let kelly_bet = compute_kelly_bet(&returns, &probabilities);
+    let kelly_bet = compute_kelly_bet(&returns);
     (kelly_bet > 0.0).then_some(Candidate {
         symbol,
         returns,

@@ -87,10 +87,13 @@ fn parse_command(input: &str) -> Option<Command> {
         "cts" => Some(Command::CurrentTrackedSymbols),
         "engdump" | "engine-dump" => Some(Command::EngineDump),
         "pi" | "price-info" => price_info(&args),
+        "rpo" | "run-pre-open" => Some(Command::RunPreOpen),
+        "rr" | "repair-records" => repair_records(&args),
         "status" => Some(Command::Status),
         "stop" => Some(Command::Stop),
         "suo" | "set-utc-offset" => set_utc_offset(&args),
         "uhist" => update_history(&args),
+        "untracked-symbols" | "usym" => Some(Command::UntrackedSymbols),
         _ => {
             println!("Unknown command \"{command}\"");
             None
@@ -116,6 +119,31 @@ fn price_info(args: &[&str]) -> Option<Command> {
     };
 
     Some(Command::PriceInfo { symbol })
+}
+
+fn repair_records(args: &[&str]) -> Option<Command> {
+    let symbols = match args.first() {
+        Some(&arg) => arg,
+        None => {
+            println!("Missing argument <symbols>. Usage: repair-records <symbols>");
+            return None;
+        }
+    };
+
+    let mut symbols_vec = Vec::new();
+    for symbol in symbols.split(',') {
+        match Symbol::from_str(symbol) {
+            Ok(symbol) => symbols_vec.push(symbol),
+            Err(error) => {
+                println!("Invalid symbol: {error}");
+                return None;
+            }
+        }
+    }
+
+    Some(Command::RepairRecords {
+        symbols: symbols_vec,
+    })
 }
 
 fn set_utc_offset(args: &[&str]) -> Option<Command> {

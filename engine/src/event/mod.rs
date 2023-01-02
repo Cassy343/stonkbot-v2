@@ -90,9 +90,12 @@ pub enum Command {
     CurrentTrackedSymbols,
     EngineDump,
     PriceInfo { symbol: Symbol },
+    RunPreOpen,
+    RepairRecords { symbols: Vec<Symbol> },
     Status,
     Stop,
     UpdateHistory { max_updates: Option<NonZeroUsize> },
+    UntrackedSymbols,
 }
 
 #[derive(Debug)]

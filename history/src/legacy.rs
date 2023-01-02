@@ -16,7 +16,7 @@ use sqlx::{
 };
 use std::collections::HashSet;
 use stock_symbol::Symbol;
-use time::{Date, OffsetDateTime};
+use time::{Date, Duration, OffsetDateTime};
 
 pub struct SqliteLocalHistory {
     database_file: String,
@@ -134,6 +134,7 @@ impl SqliteLocalHistory {
                 Some(bars) => {
                     self.update_history(
                         config,
+                        alpaca_api,
                         bars,
                         &format!("{}", date.date()),
                         (date.unix_timestamp() / SECONDS_TO_DAYS) as i64,
@@ -158,6 +159,7 @@ impl SqliteLocalHistory {
     async fn update_history(
         &self,
         config: &Config,
+        alpaca_api: &AlpacaRestApi,
         bars: HashMap<Symbol, LossyBar>,
         string_date: &str,
         numeric_date: i64,
@@ -544,11 +546,11 @@ impl SqliteLocalHistory {
         }
 
         // Repair invalid records
-        for symbol in repair_list.iter() {
-            error!(
-                "repair_record called for symbol {}, this function is not yet implemented.",
-                symbol
-            );
+        if let Err(error) = self
+            .repair_records(alpaca_api, &repair_list, &config.indicator_periods)
+            .await
+        {
+            error!("Failed to repair records: {error:?}");
         }
 
         info!("Finished updating database history.");
@@ -795,6 +797,158 @@ impl SqliteLocalHistory {
         (insert_indicators, symbol_meta)
     }
 
+    async fn repair_records(
+        &self,
+        alpaca_api: &AlpacaRestApi,
+        symbols: &[Symbol],
+        indicator_periods: &IndicatorPeriodConfig,
+    ) -> anyhow::Result<()> {
+        let now = OffsetDateTime::now_utc();
+        // About 120 market days
+        let start_date = now - Duration::days(5 * 365);
+        let mut history = alpaca_api
+            .history::<LossyBar>(symbols.iter().copied(), start_date, None)
+            .await?;
+
+        for symbol in symbols {
+            let bars = match history.remove(symbol) {
+                Some(bars) => bars,
+                None => {
+                    warn!("Could not repair record for {symbol}; insufficient market data");
+                    continue;
+                }
+            };
+
+            if let Err(error) = self.repair_record(*symbol, bars, indicator_periods).await {
+                error!("Failed to repair record for {symbol}: {error:?}");
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn repair_record(
+        &self,
+        symbol: Symbol,
+        bars: Vec<LossyBar>,
+        indicator_periods: &IndicatorPeriodConfig,
+    ) -> anyhow::Result<()> {
+        // Clean out any old stuff
+        sqlx::query("DELETE FROM CS_Day WHERE symbol=?")
+            .bind(symbol.as_str())
+            .execute(&self.connection_pool)
+            .await?;
+        sqlx::query("DELETE FROM CS_Indicators WHERE symbol=?")
+            .bind(symbol.as_str())
+            .execute(&self.connection_pool)
+            .await?;
+        sqlx::query("DELETE FROM CS_Metadata WHERE symbol=?")
+            .bind(symbol.as_str())
+            .execute(&self.connection_pool)
+            .await?;
+
+        let lead_time = [
+            indicator_periods.adl,
+            indicator_periods.adx,
+            indicator_periods.aroon,
+            indicator_periods.obv,
+            indicator_periods.perf,
+            indicator_periods.rsi,
+            indicator_periods.so,
+        ]
+        .into_iter()
+        .max()
+        .unwrap();
+
+        if bars.len() < lead_time {
+            return Ok(());
+        }
+
+        let indicator_start_index = bars.len() - lead_time;
+        for (index, bar) in bars.iter().enumerate().skip(1) {
+            let prev_close = bars[index - 1].close;
+            let change_percent = if prev_close == 0.0 {
+                0.0
+            } else {
+                100.0 * (bar.close - prev_close) / prev_close
+            };
+
+            let pulldate = bar.time.unix_timestamp() / SECONDS_TO_DAYS;
+            sqlx::query(
+                "
+                INSERT INTO CS_Day \
+                 (symbol,pulldate,open,high,low,close,volume,changePercent)
+                VALUES (?,?,?,?,?,?,?,?)
+                ",
+            )
+            .bind(symbol.as_str())
+            .bind(pulldate)
+            .bind(bar.open)
+            .bind(bar.high)
+            .bind(bar.low)
+            .bind(bar.close)
+            .bind(bar.volume as i64)
+            .bind(change_percent)
+            .execute(&self.connection_pool)
+            .await?;
+
+            if index >= indicator_start_index {
+                sqlx::query(
+                    "
+                    INSERT INTO CS_Indicators (symbol,pulldate,obv,adl,diu,did,dx,adx,aroonu,aroond,ema12,ema26,macd,sl,avgGain,avgLoss,rsi,so)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    "
+                )
+                // Identifiers
+                .bind(symbol.as_str()).bind(pulldate)
+                // Volume measures
+                .bind(0i64).bind(0i64)
+                // ADX components
+                .bind(0.0f64).bind(0.0f64).bind(0.0f64).bind(0.0f64)
+                // Aroon measures
+                .bind(50i64).bind(50i64)
+                // Exponential moving averages
+                .bind(bar.close).bind(bar.close).bind(0.0f64).bind(0.0f64)
+                // Relative strength index
+                .bind(0.0f64).bind(0.0f64).bind(50i64)
+                // Stochastic oscillator
+                .bind(50i64)
+                .execute(&self.connection_pool)
+                .await?;
+            }
+        }
+
+        let tail = &bars[bars.len() - indicator_periods.obv..];
+        let mut volumes = Vec::with_capacity(tail.len());
+        let mut span_sum = 0.0;
+        for bar in tail {
+            volumes.push(bar.volume);
+            let span = if bar.low == 0.0 {
+                0.0
+            } else {
+                (bar.high - bar.low) / bar.low
+            };
+            span_sum += span;
+        }
+
+        volumes.sort_unstable();
+        let median_volume = volumes[volumes.len() / 2];
+
+        sqlx::query(
+            "INSERT INTO CS_Metadata (symbol,avg_span,median_volume,performance) VALUES (?,?,?,?)",
+        )
+        .bind(symbol.as_str())
+        .bind(span_sum / tail.len() as f64)
+        .bind(median_volume as i64)
+        .bind(1.0)
+        .execute(&self.connection_pool)
+        .await?;
+
+        info!("Finished repairing record of {symbol}");
+
+        Ok(())
+    }
+
     // Note: this function assumes the day bar provided is complete
     fn period_range(
         day_data: &LossyBar,
@@ -925,12 +1079,24 @@ impl SqliteLocalHistory {
 
 #[async_trait]
 impl LocalHistory for SqliteLocalHistory {
+    async fn symbols(&self) -> anyhow::Result<HashSet<Symbol>> {
+        SqliteLocalHistory::symbols(self)
+            .await
+            .map(|iter| iter.collect())
+            .map_err(Into::into)
+    }
+
     async fn update_history_to_present(
         &self,
         rest: &AlpacaRestApi,
         max_updates: Option<NonZeroUsize>,
     ) -> anyhow::Result<()> {
         SqliteLocalHistory::update_history_to_present(self, rest, max_updates).await
+    }
+
+    async fn repair_records(&self, rest: &AlpacaRestApi, symbols: &[Symbol]) -> anyhow::Result<()> {
+        self.repair_records(rest, symbols, &Config::get().indicator_periods)
+            .await
     }
 
     async fn get_market_history(
