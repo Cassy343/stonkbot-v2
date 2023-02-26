@@ -26,17 +26,17 @@ impl Engine {
     pub async fn entry_strat_on_open(&mut self) {
         self.intraday.entry_strategy.candidates.clear();
         self.resolve_candidates().await;
+        let subscribing = self
+            .intraday
+            .entry_strategy
+            .candidates
+            .iter()
+            .copied()
+            .collect();
+        trace!("Subscribing to {subscribing:?}");
         self.intraday
             .stream
-            .send(StreamRequest::SubscribeBars(
-                self.intraday
-                    .portfolio_manager
-                    .candidates()
-                    .iter()
-                    .map(|candidate| candidate.symbol)
-                    .collect(),
-            ))
-            .await;
+            .send(StreamRequest::SubscribeBars(subscribing));
     }
 
     pub async fn entry_strat_on_tick(&mut self) -> anyhow::Result<()> {

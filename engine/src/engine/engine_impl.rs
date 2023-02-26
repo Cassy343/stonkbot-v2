@@ -163,7 +163,7 @@ impl Engine {
                 debug!("Received open event (next close: {next_close:?}");
                 self.clock_info.next_close = Some(next_close);
 
-                self.intraday.stream.send(StreamRequest::Open).await;
+                self.intraday.stream.send(StreamRequest::Open);
                 if let Err(error) = self.on_open().await {
                     error!("Failed to run open tasks: {error:?}");
                     self.in_safety_mode = true;
@@ -184,7 +184,7 @@ impl Engine {
                 debug!("Received close event (next open: {next_open:?}");
                 self.clock_info.next_open = Some(next_open);
 
-                self.intraday.stream.send(StreamRequest::Close).await;
+                self.intraday.stream.send(StreamRequest::Close);
                 self.on_close();
             }
             ClockEvent::Panic => {
@@ -544,6 +544,15 @@ impl Engine {
 
         match event {
             StreamEvent::MinuteBar { symbol, bar } => {
+                if self
+                    .clock_info
+                    .duration_since_open
+                    .map(|dur| dur < Duration::minutes(3))
+                    .unwrap_or(true)
+                {
+                    return;
+                }
+
                 let avg_span = self.get_avg_span(symbol).await;
 
                 if let Some(price_info) = self
@@ -561,7 +570,18 @@ impl Engine {
                         && price_info.lwm_gain > threshold
                         && price_info.lwm_gain < 2.0 * threshold;
 
-                    if sell_trigger && !buy_trigger {
+                    let (sell_trigger, buy_trigger) = match (sell_trigger, buy_trigger) {
+                        (true, true) => {
+                            if price_info.time_since_hwm < price_info.time_since_lwm {
+                                (true, false)
+                            } else {
+                                (false, true)
+                            }
+                        }
+                        (st, bt) => (st, bt),
+                    };
+
+                    if sell_trigger {
                         trace!("Sending sell trigger for {symbol}");
                         log_trace_info = true;
 
@@ -570,7 +590,7 @@ impl Engine {
                         }
                     }
 
-                    if buy_trigger && !sell_trigger {
+                    if buy_trigger {
                         trace!("Sending buy trigger for {symbol}");
                         log_trace_info = true;
 

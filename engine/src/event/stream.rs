@@ -17,7 +17,7 @@ use std::{
 use stock_symbol::Symbol;
 use tokio::{
     net::TcpStream,
-    sync::mpsc::{Receiver, Sender},
+    sync::mpsc::{UnboundedReceiver, UnboundedSender},
     task,
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
@@ -31,17 +31,12 @@ const PING_FREQUENCY: Duration = Duration::from_millis(30 * 1000);
 type WebSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 pub struct StreamRequestSender {
-    inner: Sender<IncomingEvent>,
+    inner: UnboundedSender<IncomingEvent>,
 }
 
 impl StreamRequestSender {
-    pub async fn send(&self, request: StreamRequest) {
-        if self
-            .inner
-            .send(IncomingEvent::Request(request))
-            .await
-            .is_err()
-        {
+    pub fn send(&self, request: StreamRequest) {
+        if self.inner.send(IncomingEvent::Request(request)).is_err() {
             panic!("StreamRequestSender should never dangle");
         }
     }
@@ -50,7 +45,7 @@ impl StreamRequestSender {
 pub fn make_task(
     emitter: EventEmitter<StreamEvent>,
 ) -> (StreamRequestSender, impl Future<Output = ()>) {
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
     (
         StreamRequestSender { inner: tx.clone() },
@@ -60,8 +55,8 @@ pub fn make_task(
 
 async fn run_task(
     mut emitter: EventEmitter<StreamEvent>,
-    incoming_event_sender: Sender<IncomingEvent>,
-    mut events: Receiver<IncomingEvent>,
+    incoming_event_sender: UnboundedSender<IncomingEvent>,
+    mut events: UnboundedReceiver<IncomingEvent>,
 ) {
     task::spawn({
         let incoming_event_sender = incoming_event_sender.clone();
@@ -71,7 +66,6 @@ async fn run_task(
             loop {
                 if incoming_event_sender
                     .send(IncomingEvent::CheckTimeout)
-                    .await
                     .is_err()
                 {
                     return;
@@ -103,7 +97,7 @@ async fn run_task(
                     continue;
                 }
 
-                handle_message(&mut stream, &mut emitter, message).await;
+                handle_message(&mut stream, &mut emitter, message);
             }
             IncomingEvent::CheckTimeout => check_timeout(&mut stream).await,
             IncomingEvent::Ping(data) => {
@@ -145,7 +139,7 @@ async fn run_task(
 
 async fn handle_state_discrepancies(
     stream: &mut Stream,
-    incoming_event_sender: &Sender<IncomingEvent>,
+    incoming_event_sender: &UnboundedSender<IncomingEvent>,
 ) {
     if !matches!(stream.state, StreamState::Open { .. }) {
         stream.connection_epoch += 1;
@@ -230,7 +224,7 @@ async fn handle_request(stream: &mut Stream, request: StreamRequest) {
     }
 }
 
-async fn handle_message(
+fn handle_message(
     stream: &mut Stream,
     emitter: &mut EventEmitter<StreamEvent>,
     message: StreamMessage,
@@ -247,19 +241,17 @@ async fn handle_message(
             volume,
             time,
         } => {
-            emitter
-                .emit(StreamEvent::MinuteBar {
-                    symbol,
-                    bar: Bar {
-                        open,
-                        high,
-                        low,
-                        close,
-                        volume,
-                        time,
-                    },
-                })
-                .await
+            emitter.emit(StreamEvent::MinuteBar {
+                symbol,
+                bar: Bar {
+                    open,
+                    high,
+                    low,
+                    close,
+                    volume,
+                    time,
+                },
+            });
         }
         StreamMessage::Subscription {
             trades,
@@ -399,12 +391,12 @@ async fn check_status(
 
 async fn handle_socket(
     mut socket: SplitStream<WebSocket>,
-    incoming_event_sender: Sender<IncomingEvent>,
+    incoming_event_sender: UnboundedSender<IncomingEvent>,
     connection_epoch: usize,
 ) {
     macro_rules! send {
         ($sender:expr, $msg:expr) => {
-            if $sender.send($msg).await.is_err() {
+            if $sender.send($msg).is_err() {
                 warn!("Failed to send incoming message to event loop");
             }
         };

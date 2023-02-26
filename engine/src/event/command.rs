@@ -39,7 +39,7 @@ pub async fn run_task(emitter: EventEmitter<Command>, editor: Editor<()>) {
             Ok(input) => {
                 if let Some(command) = parse_command(&input) {
                     let should_stop = matches!(command, Command::Stop);
-                    emitter.emit(command).await;
+                    emitter.emit(command);
                     if should_stop {
                         return;
                     }
@@ -48,7 +48,7 @@ pub async fn run_task(emitter: EventEmitter<Command>, editor: Editor<()>) {
                 println!();
             }
             Err(ReadlineError::Interrupted) => {
-                emitter.emit(Command::Stop).await;
+                emitter.emit(Command::Stop);
                 return;
             }
             // Do nothing

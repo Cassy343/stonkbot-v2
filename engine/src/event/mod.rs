@@ -7,18 +7,18 @@ use std::{fmt::Debug, marker::PhantomData, num::NonZeroUsize};
 use log::warn;
 use stock_symbol::Symbol;
 use time::{Duration, OffsetDateTime};
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use entity::data::Bar;
 
 pub struct EventReceiver {
-    rx: Receiver<EngineEvent>,
-    tx: Sender<EngineEvent>,
+    rx: UnboundedReceiver<EngineEvent>,
+    tx: UnboundedSender<EngineEvent>,
 }
 
 impl EventReceiver {
     pub fn new() -> Self {
-        let (tx, rx) = channel(16);
+        let (tx, rx) = unbounded_channel();
 
         Self { rx, tx }
     }
@@ -39,13 +39,13 @@ impl EventReceiver {
 }
 
 pub struct EventEmitter<T> {
-    tx: Sender<EngineEvent>,
+    tx: UnboundedSender<EngineEvent>,
     _marker: PhantomData<fn(T)>,
 }
 
 impl<T: Into<EngineEvent> + Debug> EventEmitter<T> {
-    pub async fn emit(&self, event: T) {
-        if let Err(error) = self.tx.send(event.into()).await {
+    pub fn emit(&self, event: T) {
+        if let Err(error) = self.tx.send(event.into()) {
             warn!("Failed to emit event: {:?}", error.0);
         }
     }

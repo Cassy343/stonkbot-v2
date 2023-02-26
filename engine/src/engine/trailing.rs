@@ -70,13 +70,21 @@ impl TrackedStock {
     }
 
     fn record_price(&mut self, price: Decimal, time: Time) -> PriceInfo {
-        let last_non_volatile_price = self.prices.last().unwrap().non_volatile_price;
+        let last_rec_price = self.prices.last().unwrap();
+        let last_non_volatile_price = last_rec_price.non_volatile_price;
         let f64_price = decimal_to_f64(price);
+        let elapsed = ((time - last_rec_price.time).whole_seconds() as f64) / 60.0;
 
         let non_volatile_price = if f64_price > last_non_volatile_price {
-            f64::min(last_non_volatile_price * (1.0 + self.max_step), f64_price)
+            f64::min(
+                last_non_volatile_price * (1.0 + self.max_step).powf(elapsed),
+                f64_price,
+            )
         } else {
-            f64::max(last_non_volatile_price * (1.0 - self.max_step), f64_price)
+            f64::max(
+                last_non_volatile_price * (1.0 - self.max_step).powf(elapsed),
+                f64_price,
+            )
         };
 
         self.prices.push(RecordedPrice {
@@ -85,11 +93,11 @@ impl TrackedStock {
             time,
         });
 
-        if price > self.prices[self.last_hwm].price {
+        if non_volatile_price > self.prices[self.last_hwm].non_volatile_price {
             self.last_hwm = self.prices.len() - 1;
         }
 
-        if price < self.prices[self.last_lwm].price {
+        if non_volatile_price < self.prices[self.last_lwm].non_volatile_price {
             self.last_lwm = self.prices.len() - 1;
         }
 
@@ -107,8 +115,8 @@ impl TrackedStock {
         let non_volatile_price = last_rec_price.non_volatile_price;
         let hwm = self.prices[self.last_hwm];
         let lwm = self.prices[self.last_lwm];
-        let hwm_price = decimal_to_f64(hwm.price);
-        let lwm_price = decimal_to_f64(lwm.price);
+        let hwm_price = hwm.non_volatile_price;
+        let lwm_price = lwm.non_volatile_price;
 
         Some(PriceInfo {
             latest_price: last_rec_price.price,

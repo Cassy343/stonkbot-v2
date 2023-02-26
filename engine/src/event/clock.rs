@@ -11,7 +11,7 @@ const EPSILON: StdDuration = StdDuration::from_millis(5);
 
 pub async fn run_task(emitter: EventEmitter<ClockEvent>, rest: AlpacaRestApi) {
     if run_inner(&emitter, rest).await.is_err() {
-        emitter.emit(ClockEvent::Panic).await;
+        emitter.emit(ClockEvent::Panic);
     }
 }
 
@@ -23,12 +23,10 @@ async fn run_inner(emitter: &EventEmitter<ClockEvent>, rest: AlpacaRestApi) -> R
     // Get the clock aligned with real time
 
     let last_open = if Config::get().force_open && market_clock.is_open {
-        emitter.emit(ClockEvent::PreOpen).await;
-        emitter
-            .emit(ClockEvent::Open {
-                next_close: market_clock.next_close,
-            })
-            .await;
+        emitter.emit(ClockEvent::PreOpen);
+        emitter.emit(ClockEvent::Open {
+            next_close: market_clock.next_close,
+        });
         OffsetDateTime::now_utc()
     } else {
         let last_open = market_clock.next_open;
@@ -62,12 +60,10 @@ async fn run_clock(
             let duration_since_open = current_time - last_open;
             let duration_until_close = market_clock.next_close - current_time;
 
-            emitter
-                .emit(ClockEvent::Tick {
-                    duration_since_open,
-                    duration_until_close,
-                })
-                .await;
+            emitter.emit(ClockEvent::Tick {
+                duration_since_open,
+                duration_until_close,
+            });
 
             if duration_until_close < tick_duration + EPSILON {
                 sleep(duration_until(market_clock.next_close)).await;
@@ -75,11 +71,9 @@ async fn run_clock(
             }
         }
 
-        emitter
-            .emit(ClockEvent::Close {
-                next_open: market_clock.next_open,
-            })
-            .await;
+        emitter.emit(ClockEvent::Close {
+            next_open: market_clock.next_open,
+        });
         market_clock = fetch_clock(&rest).await?;
         last_open = market_clock.next_open;
         market_clock = open_sequence(market_clock, emitter, &rest).await?;
@@ -92,13 +86,11 @@ async fn open_sequence(
     rest: &AlpacaRestApi,
 ) -> Result<Clock, Panic> {
     sleep(duration_until_pre_open(market_clock)).await;
-    emitter.emit(ClockEvent::PreOpen).await;
+    emitter.emit(ClockEvent::PreOpen);
     sleep(duration_until(market_clock.next_open)).await;
-    emitter
-        .emit(ClockEvent::Open {
-            next_close: market_clock.next_close,
-        })
-        .await;
+    emitter.emit(ClockEvent::Open {
+        next_close: market_clock.next_close,
+    });
     fetch_clock(rest).await
 }
 

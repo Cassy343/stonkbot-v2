@@ -68,10 +68,10 @@ impl OrderManager {
             .unwrap_or(TradeStatus::Untraded)
     }
 
-    pub async fn sell(&mut self, symbol: Symbol, qty: Decimal) -> anyhow::Result<()> {
-        let order = self.rest.sell_position(symbol, qty).await?;
+    pub async fn sell(&mut self, symbol: Symbol) -> anyhow::Result<()> {
+        let order = self.rest.liquidate_position(symbol).await?;
         debug!(
-            "Submitted order {} to sell {qty} shares of {symbol}",
+            "Submitted order {} to liquidate position in {symbol}",
             order.id.hyphenated()
         );
         self.trade_statuses

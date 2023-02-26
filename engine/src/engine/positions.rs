@@ -142,12 +142,9 @@ impl Engine {
     }
 
     pub async fn position_manager_on_open(&mut self) {
-        self.intraday
-            .stream
-            .send(StreamRequest::SubscribeBars(
-                self.intraday.last_position_map.keys().cloned().collect(),
-            ))
-            .await;
+        self.intraday.stream.send(StreamRequest::SubscribeBars(
+            self.intraday.last_position_map.keys().cloned().collect(),
+        ));
     }
 
     pub async fn position_manager_on_tick(&mut self) -> anyhow::Result<()> {
@@ -183,29 +180,14 @@ impl Engine {
         }
 
         // Make sure the symbol is actually a position we hold
-        let position = match self.intraday.last_position_map.get(&symbol) {
-            Some(pos) => pos,
-            None => {
-                trace!("Trigger for {symbol} ignored; no currently held position");
-                return Ok(());
-            }
-        };
-
-        let optimal_equity = self.portfolio_manager_optimal_equity(symbol);
-        let current_equity = position.market_value;
-
-        let surplus = current_equity - optimal_equity;
-        if surplus <= Decimal::ONE {
-            trace!(
-                "Trigger for {symbol} ignored; surplus amount {surplus:.2} is less than threshold"
-            );
+        if !self.intraday.last_position_map.contains_key(&symbol) {
+            trace!("Trigger for {symbol} ignored; no currently held position");
             return Ok(());
         }
 
-        debug!("Selling ${surplus:.2} of {symbol}. Optimal equity: {optimal_equity:.2}, current equity: {current_equity:.2}");
+        debug!("Liquidating position in {symbol}");
 
-        let qty = surplus / position.current_price;
-        self.intraday.order_manager.sell(symbol, qty).await?;
+        self.intraday.order_manager.sell(symbol).await?;
 
         Ok(())
     }
