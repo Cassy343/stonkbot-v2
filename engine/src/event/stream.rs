@@ -176,8 +176,9 @@ async fn handle_state_discrepancies(
                 let json = serde_json::to_string(&action).expect("Failed to encode StreamAction");
 
                 if let Err(error) = send.send(Message::Text(json)).await {
-                    error!("Failed to send message: {error:?}");
-                    stream.state = StreamState::Erroring;
+                    stream.state = StreamState::Erroring {
+                        message: format!("Failed to send message: {error:?}"),
+                    };
                     return;
                 }
             }
@@ -185,7 +186,12 @@ async fn handle_state_discrepancies(
             // Assume we succeeded
             stream.actual_sub_state = stream.expected_sub_state.clone();
         }
-        StreamState::UnexpectedlyClosed | StreamState::Erroring => {
+        StreamState::Erroring { message } => {
+            error!("{message}");
+            stream.actual_sub_state.clear();
+            stream.state = StreamState::Opening;
+        }
+        StreamState::UnexpectedlyClosed => {
             stream.actual_sub_state.clear();
             stream.state = StreamState::Opening;
         }
@@ -289,8 +295,9 @@ async fn check_timeout(stream: &mut Stream) {
                     *pong_pending = true;
                 }
                 Err(error) => {
-                    error!("Failed to send ping: {error:?}");
-                    stream.state = StreamState::Erroring;
+                    stream.state = StreamState::Erroring {
+                        message: format!("Failed to send ping: {error:?}"),
+                    };
                 }
             }
         }
@@ -441,11 +448,12 @@ async fn handle_socket(
                 warn!("Received unexpected message type: {message:?}");
             }
             Err(error) => {
-                error!("WebSocket stream enterd erroneous state: {error:?}");
                 send!(
                     incoming_event_sender,
                     IncomingEvent::StateChange {
-                        new_state: StreamState::Erroring,
+                        new_state: StreamState::Erroring {
+                            message: format!("WebSocket stream enterd erroneous state: {error:?}")
+                        },
                         epoch: connection_epoch
                     }
                 );
@@ -476,7 +484,9 @@ enum StreamState {
     },
     Closed,
     UnexpectedlyClosed,
-    Erroring,
+    Erroring {
+        message: String,
+    },
 }
 
 enum IncomingEvent {

@@ -1,6 +1,8 @@
 use std::{collections::HashMap, path::Path};
 
 use anyhow::anyhow;
+use common::config::Config;
+use common::util::decimal_to_f64;
 use entity::trading::Position;
 use log::{debug, trace};
 use num_traits::FromPrimitive;
@@ -11,6 +13,7 @@ use time::{Duration, OffsetDateTime};
 use tokio::io::AsyncReadExt;
 use tokio::{fs::OpenOptions, io::AsyncWriteExt};
 
+use crate::engine::stat;
 use crate::event::stream::StreamRequest;
 use history::LocalHistory;
 
@@ -180,9 +183,44 @@ impl Engine {
         }
 
         // Make sure the symbol is actually a position we hold
-        if !self.intraday.last_position_map.contains_key(&symbol) {
-            trace!("Trigger for {symbol} ignored; no currently held position");
-            return Ok(());
+        let position = match self.intraday.last_position_map.get(&symbol) {
+            Some(position) => position,
+            None => {
+                trace!("Trigger for {symbol} ignored; no currently held position");
+                return Ok(());
+            }
+        };
+
+        let meta = self
+            .position_manager
+            .position_meta
+            .get(&symbol)
+            .expect("No position meta");
+        let config = Config::get();
+
+        if meta.hold_time < config.trading.max_hold_time {
+            let log_return = f64::ln(1.0 + decimal_to_f64(position.unrealized_plpc));
+            let baseline_return = config.trading.baseline_return();
+            let desired_log_return = meta.hold_time as f64 * baseline_return;
+
+            if log_return < desired_log_return {
+                let candidate = self
+                    .intraday
+                    .portfolio_manager
+                    .candidate_by_symbol(symbol)
+                    .expect("No candidate for currently held position");
+                let heuristic = stat::heuristic(
+                    candidate.normal_params,
+                    log_return,
+                    meta.hold_time,
+                    config.trading.max_hold_time,
+                    baseline_return,
+                );
+                trace!("Trigger for {symbol} received; heuristic: {heuristic}");
+                if heuristic >= 1.8 {
+                    return Ok(());
+                }
+            }
         }
 
         debug!("Liquidating position in {symbol}");
@@ -192,43 +230,43 @@ impl Engine {
         Ok(())
     }
 
-    pub async fn position_buy_trigger(&mut self, symbol: Symbol) -> anyhow::Result<()> {
-        if !self
-            .intraday
-            .order_manager
-            .trade_status(symbol)
-            .is_buy_daytrade_safe()
-        {
-            trace!("Trigger for {symbol} ignored due to trade status");
-            return Ok(());
-        }
+    pub async fn position_buy_trigger(&mut self, _symbol: Symbol) -> anyhow::Result<()> {
+        // if !self
+        //     .intraday
+        //     .order_manager
+        //     .trade_status(symbol)
+        //     .is_buy_daytrade_safe()
+        // {
+        //     trace!("Trigger for {symbol} ignored due to trade status");
+        //     return Ok(());
+        // }
 
-        self.position_manager
-            .position_meta
-            .retain(|symbol, _| self.intraday.last_position_map.contains_key(symbol));
+        // self.position_manager
+        //     .position_meta
+        //     .retain(|symbol, _| self.intraday.last_position_map.contains_key(symbol));
 
-        let position = match self.intraday.last_position_map.get(&symbol) {
-            Some(pos) => pos,
-            None => {
-                trace!("Trigger for {symbol} ignored; no currently held position");
-                return Ok(());
-            }
-        };
+        // let position = match self.intraday.last_position_map.get(&symbol) {
+        //     Some(pos) => pos,
+        //     None => {
+        //         trace!("Trigger for {symbol} ignored; no currently held position");
+        //         return Ok(());
+        //     }
+        // };
 
-        let optimal_equity = self.portfolio_manager_optimal_equity(symbol);
-        let current_equity = position.market_value;
+        // let optimal_equity = self.portfolio_manager_optimal_equity(symbol);
+        // let current_equity = position.market_value;
 
-        let deficit = optimal_equity - current_equity;
-        let cash = self.portfolio_manager_available_cash();
-        let notional = Decimal::min(deficit, cash);
+        // let deficit = optimal_equity - current_equity;
+        // let cash = self.portfolio_manager_available_cash();
+        // let notional = Decimal::min(deficit, cash);
 
-        if notional <= Decimal::ONE {
-            trace!("Trigger for {symbol} ignored; notional amount {notional:.2} is less than threshold");
-            return Ok(());
-        }
+        // if notional <= Decimal::ONE {
+        //     trace!("Trigger for {symbol} ignored; notional amount {notional:.2} is less than threshold");
+        //     return Ok(());
+        // }
 
-        debug!("Buying ${notional:.2} of {symbol}. Optimal equity: {optimal_equity:.2}, current equity: {current_equity:.2}");
-        self.intraday.order_manager.buy(symbol, notional).await?;
+        // debug!("Buying ${notional:.2} of {symbol}. Optimal equity: {optimal_equity:.2}, current equity: {current_equity:.2}");
+        // self.intraday.order_manager.buy(symbol, notional).await?;
 
         Ok(())
     }

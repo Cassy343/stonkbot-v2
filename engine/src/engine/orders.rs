@@ -3,7 +3,7 @@ use std::{collections::HashMap, time::Duration};
 use anyhow::Context;
 use entity::trading::{Order, OrderRequest, OrderSide, OrderTimeInForce, OrderType};
 use log::debug;
-use rust_decimal::Decimal;
+use rust_decimal::{Decimal, RoundingStrategy};
 use serde::Serialize;
 use stock_symbol::Symbol;
 
@@ -86,7 +86,7 @@ impl OrderManager {
             .submit_order(&OrderRequest {
                 symbol,
                 qty: None,
-                notional: Some(notional),
+                notional: Some(notional.round_dp_with_strategy(2, RoundingStrategy::ToZero)),
                 side: OrderSide::Buy,
                 order_type: OrderType::Market,
                 time_in_force: OrderTimeInForce::Day,

@@ -1,5 +1,7 @@
+use libm::erf;
 use log::trace;
 use serde::Serialize;
+use std::f64::consts::TAU;
 
 const EPSILON: f64 = 1e-6;
 
@@ -160,15 +162,46 @@ fn laplace_first_moment_b(x: f64, mean: f64, b: f64) -> f64 {
     -0.5 * (b + x) * f64::exp((mean - x) / b)
 }
 
-pub fn expected_log_portfolio_return_laplace(
+fn normal_cdf(x: f64, mean: f64, var: f64) -> f64 {
+    0.5 + 0.5 * erf((x - mean) / f64::sqrt(2.0 * var))
+}
+
+fn normal_first_moment(x: f64, mean: f64, var: f64) -> f64 {
+    let x_off = x - mean;
+    let half_mean = 0.5 * mean;
+    let two_var = 2.0 * var;
+
+    half_mean + half_mean * erf(x_off / f64::sqrt(two_var))
+        - f64::sqrt(var / TAU) * f64::exp((-1.0 / two_var) * x_off * x_off)
+}
+
+pub fn heuristic(
+    params: NormalParameters,
+    mean_offset: f64,
+    hold_time: u32,
+    max_hold_time: u32,
+    baseline_return: f64,
+) -> f64 {
+    let time_delta = (max_hold_time - hold_time) as f64;
+    let mean = time_delta * params.mean + mean_offset;
+    let var = time_delta * params.var;
+    let target_return = max_hold_time as f64 * baseline_return;
+
+    let prob_meet_goal = 1.0 - normal_cdf(target_return, mean, var);
+    let prob_pos_return = 1.0 - normal_cdf(0.0, mean, var);
+
+    2.0 * prob_meet_goal + prob_pos_return
+}
+
+pub fn expected_log_portfolio_return_normal(
     fractions: &[f64],
-    parameters: &[LaplaceParameters],
+    parameters: &[NormalParameters],
 ) -> f64 {
     assert_eq!(fractions.len(), parameters.len());
 
     let meta = parameters
         .iter()
-        .map(|&params| LaplaceMeta::from(params))
+        .map(|&params| NormalMeta::from(params))
         .collect::<Vec<_>>();
 
     let mut exp_log_return = 0.0;
@@ -194,14 +227,14 @@ pub fn expected_log_portfolio_return_laplace(
     exp_log_return
 }
 
-pub fn optimize_portfolio_laplace(parameters: &[LaplaceParameters]) -> Vec<f64> {
+pub fn optimize_portfolio_normal(parameters: &[NormalParameters]) -> Vec<f64> {
     if parameters.is_empty() {
         return Vec::new();
     }
 
     let meta = parameters
         .iter()
-        .map(|&params| LaplaceMeta::from(params))
+        .map(|&params| NormalMeta::from(params))
         .collect::<Vec<_>>();
 
     // TODO: re-tune this
@@ -297,38 +330,26 @@ pub fn optimize_portfolio_laplace(parameters: &[LaplaceParameters]) -> Vec<f64> 
 }
 
 #[derive(Clone, Copy, Serialize, Debug)]
-pub struct LaplaceParameters {
+pub struct NormalParameters {
     pub mean: f64,
-    pub b: f64,
+    pub var: f64,
 }
 
 #[derive(Debug)]
-struct LaplaceMeta {
+struct NormalMeta {
     exp_loss: f64,
     loss_prob: f64,
     exp_gain: f64,
     gain_prob: f64,
 }
 
-impl From<LaplaceParameters> for LaplaceMeta {
-    fn from(LaplaceParameters { mean, b }: LaplaceParameters) -> Self {
-        let (exp_loss, exp_gain) = if mean < 0.0 {
-            (
-                laplace_first_moment_a(mean, mean, b) + laplace_first_moment_b(0.0, mean, b)
-                    - laplace_first_moment_b(mean, mean, b),
-                -laplace_first_moment_b(0.0, mean, b),
-            )
-        } else {
-            (
-                laplace_first_moment_a(0.0, mean, b),
-                laplace_first_moment_a(mean, mean, b)
-                    - laplace_first_moment_a(0.0, mean, b)
-                    - laplace_first_moment_b(mean, mean, b),
-            )
-        };
-
-        let loss_prob = laplace_cdf(0.0, mean, b);
+impl From<NormalParameters> for NormalMeta {
+    fn from(NormalParameters { mean, var }: NormalParameters) -> Self {
+        let loss_prob = normal_cdf(0.0, mean, var);
         let gain_prob = 1.0 - loss_prob;
+        let moment = normal_first_moment(0.0, mean, var);
+        let exp_loss = f64::exp(moment / loss_prob) - 1.0;
+        let exp_gain = f64::exp((mean - moment) / gain_prob) - 1.0;
 
         Self {
             exp_loss,

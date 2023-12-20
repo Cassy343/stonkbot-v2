@@ -1,19 +1,15 @@
 use std::{
-    cmp::{Ordering, Reverse},
-    collections::{BTreeMap, BinaryHeap, HashMap},
+    cmp::Reverse,
+    collections::{HashMap, HashSet},
 };
 
-use crate::engine::kelly;
+use crate::engine::stat;
 use anyhow::{anyhow, Context};
 use common::util::{decimal_to_f64, TotalF64};
 use common::{config::Config, util::f64_to_decimal};
-use entity::{
-    data::Bar,
-    trading::{AssetStatus, Position},
-};
+use entity::{data::Bar, trading::AssetStatus};
 use history::LocalHistory;
-use log::{debug, error, trace};
-use rand::{thread_rng, Rng};
+use log::{debug, error};
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -23,7 +19,7 @@ use tokio::task;
 
 use super::{
     engine_impl::Engine,
-    kelly::{compute_kelly_bet, LaplaceParameters},
+    stat::{compute_kelly_bet, NormalParameters},
 };
 
 #[derive(Serialize)]
@@ -31,8 +27,7 @@ pub struct PortfolioManager {
     #[serde(skip)]
     symbol_indexed_candidates: HashMap<Symbol, usize>,
     candidates: Vec<Candidate>,
-    // We need the order of iteration to be consistent
-    portfolio: BTreeMap<Symbol, f64>,
+    aux_candidates: Vec<Symbol>,
 }
 
 #[derive(Default)]
@@ -46,19 +41,19 @@ impl PortfolioManager {
         Self {
             symbol_indexed_candidates: HashMap::new(),
             candidates: Vec::new(),
-            portfolio: BTreeMap::new(),
+            aux_candidates: Vec::new(),
         }
-    }
-
-    pub fn portfolio(&self) -> &BTreeMap<Symbol, f64> {
-        &self.portfolio
     }
 
     pub fn candidates(&self) -> &[Candidate] {
         &self.candidates
     }
 
-    fn candidate_by_symbol(&self, symbol: Symbol) -> Option<&Candidate> {
+    pub fn aux_candidates(&self) -> &[Symbol] {
+        &self.aux_candidates
+    }
+
+    pub fn candidate_by_symbol(&self, symbol: Symbol) -> Option<&Candidate> {
         self.symbol_indexed_candidates
             .get(&symbol)
             .map(|&i| &self.candidates[i])
@@ -69,6 +64,7 @@ impl PortfolioManager {
             .map(|candidate| &*candidate.returns)
     }
 
+    /*
     fn optimize_portfolio_old(&mut self, positions: &HashMap<Symbol, Position>) {
         debug!("Optimizing portfolio");
         let mut best_portfolio = BTreeMap::new();
@@ -129,12 +125,12 @@ impl PortfolioManager {
                     probabilities,
                 } = self.generate_expectation_matrices_old(&self.portfolio);
                 let mut fractions =
-                    kelly::optimize_portfolio(self.portfolio.len(), &returns, &probabilities);
+                    stat::optimize_portfolio(self.portfolio.len(), &returns, &probabilities);
                 log::debug!("{fractions:?}");
                 let total = fractions.iter().sum::<f64>();
                 fractions.iter_mut().for_each(|f| *f /= total);
                 let expected_return =
-                    kelly::expected_log_portfolio_return(&fractions, &returns, &probabilities);
+                    stat::expected_log_portfolio_return(&fractions, &returns, &probabilities);
                 self.portfolio
                     .values_mut()
                     .zip(fractions)
@@ -204,12 +200,12 @@ impl PortfolioManager {
             let params = portfolio
                 .candidates
                 .iter()
-                .map(|candidate| candidate.laplace_params)
+                .map(|candidate| candidate.normal_params)
                 .collect::<Vec<_>>();
-            let mut fractions = kelly::optimize_portfolio_laplace(&params);
+            let mut fractions = stat::optimize_portfolio_normal(&params);
             let sum = fractions.iter().sum::<f64>();
             fractions.iter_mut().for_each(|f| *f /= sum);
-            let exp_log_return = kelly::expected_log_portfolio_return_laplace(&fractions, &params);
+            let exp_log_return = stat::expected_log_portfolio_return_normal(&fractions, &params);
             trace!("{exp_log_return}");
 
             portfolio.fractions = fractions;
@@ -247,11 +243,11 @@ impl PortfolioManager {
             probabilities,
         } = self.generate_expectation_matrices(&candidate.candidates);
         let mut fractions =
-            kelly::optimize_portfolio(candidate.candidates.len(), &returns, &probabilities);
+            stat::optimize_portfolio(candidate.candidates.len(), &returns, &probabilities);
         let total = fractions.iter().sum::<f64>();
         fractions.iter_mut().for_each(|f| *f /= total);
         let expected_return =
-            kelly::expected_log_portfolio_return(&fractions, &returns, &probabilities);
+            stat::expected_log_portfolio_return(&fractions, &returns, &probabilities);
         (fractions, expected_return)
     }
 
@@ -332,29 +328,97 @@ impl PortfolioManager {
             probabilities,
         }
     }
+    */
 }
 
 impl Engine {
-    pub fn portfolio_manager_optimal_equity(&self, symbol: Symbol) -> Decimal {
-        let fraction = match self.intraday.portfolio_manager.portfolio.get(&symbol) {
-            Some(&f) => f,
-            None => return Decimal::ZERO,
-        };
+    pub fn portfolio_manager_optimal_equity(
+        &mut self,
+        symbols: &[Symbol],
+    ) -> anyhow::Result<Vec<Decimal>> {
+        let pm = &mut self.intraday.portfolio_manager;
+        let lpm = &self.intraday.last_position_map;
+        let mut params = Vec::with_capacity(symbols.len());
 
-        let fraction = match f64_to_decimal(fraction) {
-            Ok(f) => f,
-            Err(_) => {
-                error!(
-                    "Failed to convert portfolio float fraction to decimal. Portfolio: {:?}",
-                    self.intraday.portfolio_manager.portfolio
-                );
-                return Decimal::ZERO;
+        for &symbol in symbols {
+            match pm.candidate_by_symbol(symbol) {
+                Some(candidate) => params.push(candidate.normal_params),
+                None => return Err(anyhow!("No candidate for symbol {symbol}")),
             }
-        };
+        }
 
-        let total_equity = self.intraday.last_account.equity;
-        let usable_equity = Decimal::new(95, 2) * total_equity;
-        fraction * usable_equity
+        let symbol_set = symbols.iter().copied().collect::<HashSet<_>>();
+        let mut num_in_portfolio = 0;
+        params.extend(
+            lpm.keys()
+                .copied()
+                .filter(|symbol| {
+                    let in_portfolio = symbol_set.contains(symbol);
+                    if in_portfolio {
+                        num_in_portfolio += 1;
+                    }
+                    !in_portfolio
+                })
+                .map(|symbol| {
+                    pm.candidate_by_symbol(symbol)
+                        .expect("No candidacy for position symbol")
+                        .normal_params
+                }),
+        );
+
+        let config = Config::get();
+        let mut fractions = stat::optimize_portfolio_normal(&params);
+        let sum = fractions.iter().sum::<f64>();
+        fractions.iter_mut().for_each(|f| *f /= sum);
+
+        let mut equities = Vec::with_capacity(symbols.len());
+        let fraction_scaling_factor = Decimal::from(lpm.len() + symbols.len() - num_in_portfolio)
+            / Decimal::from(config.trading.max_position_count);
+        for (symbol, fraction) in symbols.iter().zip(fractions) {
+            if let Some(position) = lpm.get(symbol) {
+                equities.push(position.market_value);
+                continue;
+            }
+
+            let fraction = match f64_to_decimal(fraction) {
+                Ok(f) => f * fraction_scaling_factor,
+                Err(_) => {
+                    error!(
+                        "Failed to convert float fraction to decimal. Fraction: {:?}",
+                        fraction
+                    );
+                    equities.push(Decimal::ZERO);
+                    continue;
+                }
+            };
+
+            if fraction < config.trading.minimum_position_equity_fraction {
+                equities.push(Decimal::ZERO);
+                continue;
+            }
+
+            let total_equity = self.intraday.last_account.equity;
+            let usable_equity = Decimal::new(95, 2) * total_equity;
+            equities.push(fraction * usable_equity);
+        }
+
+        Ok(equities)
+
+        // let fraction = match self.intraday.portfolio_manager.portfolio.get(&symbol) {
+        //     Some(&f) => f,
+        //     None => return Decimal::ZERO,
+        // };
+
+        // let fraction = match f64_to_decimal(fraction) {
+        //     Ok(f) => f,
+        //     Err(_) => {
+        //         error!(
+        //             "Failed to convert portfolio float fraction to decimal. Portfolio: {:?}",
+        //             self.intraday.portfolio_manager.portfolio
+        //         );
+        //         return Decimal::ZERO;
+        //     }
+        // };
     }
 
     pub fn portfolio_manager_available_cash(&self) -> Decimal {
@@ -368,19 +432,38 @@ impl Engine {
     pub async fn portfolio_manager_on_pre_open(&mut self) -> anyhow::Result<()> {
         debug!("Running portfolio manager pre-open task");
 
+        let config = Config::get();
+        let minimum_median_volume = config.trading.minimum_median_volume;
+
         let current_time = OffsetDateTime::now_utc();
         debug!("Fetching historical bars");
         let mut history = self
             .local_history
-            .get_market_history(current_time - Duration::days(7 * 6), None)
+            .get_market_history(current_time - Duration::days(7 * 13), None)
             .await
             .context("Failed to fetch market history")?;
 
         debug!("Fetching equities list");
-        self.rest
-            .us_equities()
-            .await?
-            .into_iter()
+        let equities = self.rest.us_equities().await?;
+
+        let aux_candidates = equities
+            .iter()
+            .filter(|equity| {
+                equity.easy_to_borrow
+                    && equity.shortable
+                    && equity.tradable
+                    && equity.status == AssetStatus::Active
+            })
+            .flat_map(|equity| equity.symbol.to_compact())
+            .flat_map(|symbol| history.get(&symbol).map(|bars| (symbol, &**bars)))
+            .flat_map(|(symbol, bars)| median_volume(bars).map(|median| (symbol, median)))
+            .flat_map(|(symbol, MedianVolume { median, zero_count })| {
+                (median >= minimum_median_volume && zero_count < 3).then_some(symbol)
+            })
+            .collect::<Vec<_>>();
+
+        equities
+            .iter()
             .filter(|equity| {
                 !(equity.tradable && equity.fractionable) || equity.status != AssetStatus::Active
             })
@@ -390,11 +473,16 @@ impl Engine {
             });
 
         debug!("Collecting historical bars");
-        let positions = &self.intraday.last_position_map;
+        let portfolio_symbols = self
+            .intraday
+            .last_position_map
+            .keys()
+            .copied()
+            .collect::<HashSet<_>>();
         let mut candidates = Vec::new();
 
-        for (symbol, hist) in positions
-            .keys()
+        for (symbol, hist) in portfolio_symbols
+            .iter()
             .map(|symbol| (*symbol, history.get(symbol)))
         {
             let hist = match hist {
@@ -411,16 +499,16 @@ impl Engine {
         debug!("Computing candidates");
 
         let additional_candidates = task::spawn_blocking(move || {
-            let config = Config::get();
-            let minimum_median_volume = config.trading.minimum_median_volume;
-
-            let candidates = history
+            let mut candidates = history
                 .into_par_iter()
+                .filter(|(symbol, _)| !portfolio_symbols.contains(symbol))
                 .flat_map(|(symbol, bars)| {
                     compute_candidate(symbol, bars, minimum_median_volume, false)
                 })
                 .collect::<Vec<_>>();
 
+            candidates.sort_unstable_by_key(|candidate| Reverse(TotalF64(candidate.heuristic)));
+            candidates.truncate(25);
             candidates
         })
         .await
@@ -438,8 +526,7 @@ impl Engine {
         }
 
         pm.candidates = candidates;
-
-        pm.optimize_portfolio();
+        pm.aux_candidates = aux_candidates;
 
         Ok(())
     }
@@ -451,7 +538,32 @@ pub struct Candidate {
     #[serde(skip)]
     pub returns: Vec<f64>,
     pub kelly_bet: f64,
-    pub laplace_params: LaplaceParameters,
+    pub normal_params: NormalParameters,
+    pub heuristic: f64,
+}
+
+struct MedianVolume {
+    median: u64,
+    zero_count: usize,
+}
+
+fn median_volume(bars: &[Bar]) -> Option<MedianVolume> {
+    if bars.is_empty() {
+        return None;
+    }
+
+    let mut volumes = bars.iter().map(|bar| bar.volume).collect::<Vec<_>>();
+    volumes.sort_unstable();
+    let mid = volumes.len() / 2;
+    let median = if volumes.len() % 2 == 0 {
+        (volumes[mid - 1] + volumes[mid]) / 2
+    } else {
+        volumes[mid]
+    };
+    // This gives us the total count since the vec is sorted
+    let zero_count = volumes.iter().take_while(|&&vol| vol == 0).count();
+
+    Some(MedianVolume { median, zero_count })
 }
 
 fn compute_candidate(
@@ -465,43 +577,48 @@ fn compute_candidate(
     }
 
     if !force_compute {
-        let mut volumes = bars.iter().map(|bar| bar.volume).collect::<Vec<_>>();
-        volumes.sort_unstable();
-        let mid = volumes.len() / 2;
-        let median_volume = if volumes.len() % 2 == 0 {
-            (volumes[mid - 1] + volumes[mid]) / 2
-        } else {
-            volumes[mid]
-        };
+        let MedianVolume { median, zero_count } =
+            median_volume(&bars).expect("We should have enough data to compute the median");
 
-        if median_volume < minimum_median_volume
-            || volumes.iter().filter(|&&volume| volume == 0).count() >= 3
-        {
+        if median < minimum_median_volume || zero_count >= 3 {
             return None;
         }
     }
 
     let returns = sanitized_returns(&bars);
+    let log_returns = returns
+        .iter()
+        .map(|&r| f64::ln(1.0 + r))
+        .collect::<Vec<_>>();
 
-    let mean_return = returns.iter().sum::<f64>() / returns.len() as f64;
-    let b = f64::sqrt(
-        returns
-            .iter()
-            .map(|&r| (r - mean_return) * (r - mean_return))
-            .sum::<f64>()
-            / (returns.len() - 1) as f64,
-    ) / std::f64::consts::SQRT_2;
+    let config = Config::get();
+    let mean_log_return = log_returns.iter().sum::<f64>() / log_returns.len() as f64;
+    let var = log_returns
+        .iter()
+        .map(|&r| (r - mean_log_return) * (r - mean_log_return))
+        .sum::<f64>()
+        / (log_returns.len() - 1) as f64;
 
     let kelly_bet = compute_kelly_bet(&returns);
-    if kelly_bet > 0.0 || force_compute {
+    let normal_params = NormalParameters {
+        mean: mean_log_return,
+        var,
+    };
+    let heuristic = stat::heuristic(
+        normal_params,
+        0.0,
+        0,
+        config.trading.max_hold_time,
+        config.trading.baseline_return(),
+    );
+
+    if (kelly_bet > 0.0 && heuristic >= 2.0) || force_compute {
         Some(Candidate {
             symbol,
             returns,
             kelly_bet,
-            laplace_params: LaplaceParameters {
-                mean: mean_return,
-                b,
-            },
+            normal_params,
+            heuristic,
         })
     } else {
         None
@@ -526,7 +643,7 @@ fn sanitized_returns(bars: &[Bar]) -> Vec<f64> {
         / log_returns.len() as f64)
         .sqrt();
     returns.iter_mut().zip(log_returns).for_each(|(r, lr)| {
-        if f64::abs((lr - avg_log_return) / std_dev) >= 3.0 {
+        if f64::abs((lr - avg_log_return) / std_dev) >= 2.5 {
             *r = avg_return - 1.0;
         } else {
             *r -= 1.0;

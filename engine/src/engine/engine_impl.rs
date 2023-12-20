@@ -259,6 +259,19 @@ impl Engine {
 
     fn on_close(&mut self) {
         self.intraday.order_manager.clear();
+
+        let price_tracker_json = self.intraday.price_tracker.patched_json();
+        let file = format!(
+            "intraday/{}.json",
+            Config::localize(OffsetDateTime::now_utc()).date()
+        );
+        match fs::write(&file, price_tracker_json) {
+            Ok(()) => info!("Wrote intraday data to {file}"),
+            Err(_) => {
+                info!("Could not write intraday data to {file}, does its parent directory exit?")
+            }
+        }
+
         self.intraday.price_tracker.clear();
     }
 
@@ -544,14 +557,14 @@ impl Engine {
 
         match event {
             StreamEvent::MinuteBar { symbol, bar } => {
-                if self
-                    .clock_info
-                    .duration_since_open
-                    .map(|dur| dur < Duration::minutes(3))
-                    .unwrap_or(true)
-                {
-                    return;
-                }
+                // if self
+                //     .clock_info
+                //     .duration_since_open
+                //     .map(|dur| dur < Duration::minutes(3))
+                //     .unwrap_or(true)
+                // {
+                //     return;
+                // }
 
                 let avg_span = self.get_avg_span(symbol).await;
 
@@ -588,6 +601,8 @@ impl Engine {
                         if let Err(error) = self.position_sell_trigger(symbol).await {
                             error!("Failed to handle position sell trigger: {error:?}");
                         }
+
+                        self.entry_strat_sell_trigger(symbol);
                     }
 
                     if buy_trigger {
@@ -598,9 +613,7 @@ impl Engine {
                             error!("Failed to handle position buy trigger: {error:?}");
                         }
 
-                        if let Err(error) = self.entry_strat_buy_trigger(symbol).await {
-                            error!("Failed to handle entry buy trigger: {error:?}");
-                        }
+                        self.entry_strat_buy_trigger(symbol);
                     }
 
                     if log_trace_info {

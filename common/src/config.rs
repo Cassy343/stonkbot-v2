@@ -4,6 +4,7 @@ use log::LevelFilter;
 use once_cell::sync::OnceCell;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::f64::consts::LN_2;
 use std::fs;
 use std::{
     env::{self, VarError},
@@ -220,6 +221,14 @@ pub struct TradingConfig {
     pub cash_buffer_factor: Decimal,
     pub minimum_median_volume: u64,
     pub max_position_count: usize,
+    pub time_to_double: u32,
+    pub minimum_position_equity_fraction: Decimal,
+}
+
+impl TradingConfig {
+    pub fn baseline_return(&self) -> f64 {
+        (1.0 / self.time_to_double as f64) * LN_2
+    }
 }
 
 impl Default for TradingConfig {
@@ -232,6 +241,8 @@ impl Default for TradingConfig {
             cash_buffer_factor: Decimal::new(16, 0),
             minimum_median_volume: 750_000,
             max_position_count: 10,
+            time_to_double: 250,
+            minimum_position_equity_fraction: Decimal::new(5, 2),
         }
     }
 }

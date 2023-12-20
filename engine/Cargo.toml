@@ -11,6 +11,7 @@ rest = { path = "../rest" }
 anyhow = "1.0.58"
 flate2 = "1.0.24"
 futures = "0.3.21"
+libm = "0.2.7"
 log = "0.4.17"
 num-traits = "0.2.15"
 rand = "0.8.5"

@@ -1,6 +1,6 @@
 use std::collections::{hash_map::Entry, HashMap};
 
-use common::util::decimal_to_f64;
+use common::{config::Config, util::decimal_to_f64};
 use entity::data::Bar;
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -31,7 +31,7 @@ impl PriceTracker {
 
     pub fn record_price(&mut self, symbol: Symbol, avg_span: f64, bar: Bar) -> Option<PriceInfo> {
         let price = (bar.high + bar.low) / Decimal::TWO;
-        let time = bar.time.time();
+        let time = Config::localize(bar.time).time();
 
         match self.stocks.entry(symbol) {
             Entry::Occupied(mut entry) => Some(entry.get_mut().record_price(price, time)),
@@ -44,6 +44,33 @@ impl PriceTracker {
 
     pub fn clear(&mut self) {
         self.stocks.clear();
+    }
+
+    pub fn patched_json(&self) -> String {
+        let open = Time::from_hms(9, 30, 0).unwrap();
+        let mut history = HashMap::with_capacity(self.stocks.len());
+        for (&symbol, stock) in &self.stocks {
+            let mut prices_iter = stock.prices.iter().peekable();
+            let mut price = match prices_iter.next() {
+                Some(price) => price,
+                None => continue,
+            };
+            let mut prices = Vec::with_capacity(390);
+            for mso in 0..390 {
+                while let Some(&next_price) = prices_iter.peek() {
+                    if (next_price.time - open).whole_minutes() <= mso {
+                        price = next_price;
+                        prices_iter.next();
+                    } else {
+                        break;
+                    }
+                }
+
+                prices.push(decimal_to_f64(price.price));
+            }
+            history.insert(symbol, prices);
+        }
+        serde_json::to_string(&history).unwrap()
     }
 }
 

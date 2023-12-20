@@ -6,6 +6,7 @@ members = [
     "history",
     "rest",
 ]
+resolver = "2"
 
 [profile.release]
 opt-level = 3
