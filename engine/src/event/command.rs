@@ -5,12 +5,13 @@ use crate::event::{Command, EventEmitter};
 use common::config::Config;
 use log::error;
 use rustyline::error::ReadlineError;
+use rustyline::history::FileHistory;
 use rustyline::Editor;
 use stock_symbol::Symbol;
 use time::UtcOffset;
 use tokio::task;
 
-pub async fn run_task(emitter: EventEmitter<Command>, editor: Editor<()>) {
+pub async fn run_task(emitter: EventEmitter<Command>, editor: Editor<(), FileHistory>) {
     let mut editor = Some(Box::new(editor));
     let mut error_count = 0;
 

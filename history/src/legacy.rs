@@ -4,7 +4,7 @@ use std::{
 };
 
 use super::LocalHistory;
-use ::entity::data::{Bar, LossyBar};
+use ::entity::data::{Bar, LossyBar, SymbolMetadata};
 use async_trait::async_trait;
 use common::config::{Config, IndicatorPeriodConfig};
 use common::util::{f64_to_decimal, SECONDS_TO_DAYS};
@@ -68,7 +68,7 @@ impl SqliteLocalHistory {
             );
             ",
         )
-        .execute(&mut conn)
+        .execute(&mut *conn)
         .await?;
 
         Ok(SqliteLocalHistory {
@@ -92,6 +92,7 @@ impl SqliteLocalHistory {
         alpaca_api: &AlpacaRestApi,
         max_updates: Option<NonZeroUsize>,
     ) -> Result<(), anyhow::Error> {
+        info!("Fetching most recent market day from local history");
         // Find the last market day and add one to it
         let mut past_market_day = sqlx::query_as::<_, (i64,)>("SELECT MAX(pulldate) FROM CS_Day")
             .fetch_one(&self.connection_pool)
@@ -101,6 +102,7 @@ impl SqliteLocalHistory {
         let today = OffsetDateTime::now_utc().unix_timestamp() / SECONDS_TO_DAYS;
         let config = Config::get();
 
+        info!("Fetching latest historical data");
         let start_date = OffsetDateTime::from_unix_timestamp(past_market_day * SECONDS_TO_DAYS)?;
         let history = alpaca_api
             .history::<LossyBar>(self.symbols().await?, start_date, None)
@@ -151,6 +153,10 @@ impl SqliteLocalHistory {
                     break;
                 }
             }
+        }
+
+        if num_updates == 0 {
+            info!("Already up to date.");
         }
 
         Ok(())
@@ -240,7 +246,7 @@ impl SqliteLocalHistory {
                     avg_loss: row.try_get("avgLoss")?,
                     dx_desc: Vec::with_capacity(indicator_periods.adx - 2),
                     period_day_data_desc: Vec::with_capacity(max_indicator_period),
-                    metadata: entity::SymbolMetadata {
+                    metadata: SymbolMetadata {
                         average_span: 0.1,
                         median_volume: 0,
                         performance: 1.0,
@@ -309,10 +315,12 @@ impl SqliteLocalHistory {
             let symbol: Symbol = row.try_get("symbol")?;
             match all_indicator_data.get_mut(&symbol) {
                 Some(indicator_data) => {
-                    indicator_data.metadata = entity::SymbolMetadata {
+                    let performance = row.try_get("performance")?;
+                    log::debug!("performance of {symbol} is {performance}");
+                    indicator_data.metadata = SymbolMetadata {
                         average_span: row.try_get("avg_span")?,
                         median_volume: row.try_get("median_volume")?,
-                        performance: row.try_get("performance")?,
+                        performance,
                     };
                 }
                 None => {
@@ -326,7 +334,7 @@ impl SqliteLocalHistory {
         drop(metadata_stream);
 
         let mut transaction = self.connection_pool.begin().await?;
-        let mut metadata: HashMap<Symbol, entity::SymbolMetadata> = HashMap::new();
+        let mut metadata: HashMap<Symbol, SymbolMetadata> = HashMap::new();
 
         // Filter the bars which have valid data and whose symbols are already in the record
         // Note: all unwraps on bar fields in this loop are safe since the bars are checked by the filter
@@ -363,7 +371,7 @@ impl SqliteLocalHistory {
                     .bind(close)
                     .bind(bar.volume as i64)
                     .bind(change_percent)
-                    .execute(&mut transaction)
+                    .execute(&mut *transaction)
                     .await;
 
                     // Check the day data insertion
@@ -385,7 +393,7 @@ impl SqliteLocalHistory {
                     .await;
 
                     // Check the indicator data insertion
-                    if let Err(e) = insert_indicators.execute(&mut transaction).await {
+                    if let Err(e) = insert_indicators.execute(&mut *transaction).await {
                         error!("Failed to insert indicator data for {}: {}", symbol, e);
                         repair_list.push(symbol.to_owned());
                         continue;
@@ -521,11 +529,6 @@ impl SqliteLocalHistory {
             }
         }
 
-        let normalization_factor = metadata
-            .iter()
-            .map(|(_, symbol_meta)| symbol_meta.performance * symbol_meta.performance)
-            .sum::<f64>()
-            .sqrt();
         for (symbol, symbol_meta) in metadata.drain() {
             let update_meta_result = sqlx::query(
                 "
@@ -534,7 +537,7 @@ impl SqliteLocalHistory {
             )
             .bind(symbol_meta.average_span)
             .bind(symbol_meta.median_volume)
-            .bind(symbol_meta.performance / normalization_factor)
+            .bind(symbol_meta.performance)
             .bind(symbol.as_str())
             .execute(&self.connection_pool)
             .await;
@@ -568,7 +571,7 @@ impl SqliteLocalHistory {
         override_error: bool,
     ) -> (
         Query<'a, Sqlite, <Sqlite as HasArguments<'a>>::Arguments>,
-        entity::SymbolMetadata,
+        SymbolMetadata,
     ) {
         // These will be used multiple times during computation
         #[allow(clippy::needless_late_init)]
@@ -723,24 +726,14 @@ impl SqliteLocalHistory {
         /* Metadata */
         /************/
 
-        let mut combined_change_percent =
-            1.0 + (change_percent / 100.0).min(1.0).max(-1.0 + f64::EPSILON);
-        for day_data in period_day_data_desc.iter().take(indicator_periods.perf - 1) {
-            combined_change_percent *= 1.0
-                + (day_data.change_percent / 100.0)
-                    .min(1.0)
-                    .max(-1.0 + f64::EPSILON);
-        }
-        let error = if override_error {
-            1.0
-        } else if combined_change_percent > 0.0 && combined_change_percent <= 2.0 {
-            1.0 / (1.0 + f64::exp(2.0 * (combined_change_percent - 1.0)))
-        } else if combined_change_percent < 1.0 {
-            1.0
+        let eta = Config::get().trading.eta;
+        let loss = if override_error {
+            1.0 / eta
         } else {
-            0.0
+            let clamped_return = (1.0 + change_percent / 100.0).min(1.0 / 0.95).max(0.95);
+            -f64::ln(clamped_return)
         };
-        let performance = indicator_data.metadata.performance * (1.0 - 0.05 * error);
+        let performance = indicator_data.metadata.performance * f64::exp(-eta * loss);
 
         let low = day_data.low;
         let span = if low == 0.0 {
@@ -788,7 +781,7 @@ impl SqliteLocalHistory {
         // Stochastic oscillator
         .bind(so);
 
-        let symbol_meta = entity::SymbolMetadata {
+        let symbol_meta = SymbolMetadata {
             average_span,
             median_volume,
             performance,
@@ -993,6 +986,8 @@ impl Drop for SqliteLocalHistory {
 
 // Structs for storing related data together
 mod entity {
+    use super::SymbolMetadata;
+
     pub struct IndicatorDataInput {
         pub obv: i64,
         pub adl: i64,
@@ -1019,12 +1014,6 @@ mod entity {
         pub high_index: usize,
         pub low: f64,
         pub low_index: usize,
-    }
-
-    pub struct SymbolMetadata {
-        pub average_span: f64,
-        pub median_volume: i64,
-        pub performance: f64,
     }
 
     #[derive(sqlx::FromRow, Debug, Clone, Copy)]
@@ -1175,6 +1164,30 @@ impl LocalHistory for SqliteLocalHistory {
             .await
             .map(|(span,)| span)
             .map_err(Into::into)
+    }
+
+    async fn get_metadata(&self) -> anyhow::Result<HashMap<Symbol, SymbolMetadata>> {
+        let mut meta_iter = sqlx::query_as::<_, (Symbol, f64, i64, f64)>(
+            "SELECT symbol,avg_span,median_volume,performance FROM CS_Metadata",
+        )
+        .fetch(&self.connection_pool);
+
+        let mut meta = HashMap::new();
+
+        while let Some((symbol, average_span, median_volume, performance)) =
+            meta_iter.next().await.transpose()?
+        {
+            meta.insert(
+                symbol,
+                SymbolMetadata {
+                    average_span,
+                    median_volume,
+                    performance,
+                },
+            );
+        }
+
+        Ok(meta)
     }
 
     async fn refresh_connection(&mut self) -> anyhow::Result<()> {

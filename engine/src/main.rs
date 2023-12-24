@@ -8,6 +8,7 @@ use event::*;
 use event::{Command, EventReceiver};
 use log::error;
 use rest::AlpacaRestApi;
+use rustyline::history::FileHistory;
 use rustyline::Editor;
 use std::panic::{self, AssertUnwindSafe};
 use tokio::{runtime::Builder, task};
@@ -19,7 +20,7 @@ fn main() {
 }
 
 fn setup_and_launch() -> Result<(), anyhow::Error> {
-    let (editor, logger_printer) = Editor::<()>::new()
+    let (editor, logger_printer) = Editor::<(), FileHistory>::new()
         .and_then(|mut editor| {
             let printer = editor.create_external_printer()?;
             Ok((editor, printer))
@@ -63,7 +64,7 @@ fn setup_and_launch() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-async fn launch(editor: Editor<()>) -> anyhow::Result<()> {
+async fn launch(editor: Editor<(), FileHistory>) -> anyhow::Result<()> {
     let rest_api = AlpacaRestApi::new()
         .await
         .context("Failed to setup REST API")?;

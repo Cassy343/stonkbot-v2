@@ -1,11 +1,11 @@
 use crate::util::SerdeLevelFilter;
 use anyhow::{anyhow, Context};
 use log::LevelFilter;
-use once_cell::sync::OnceCell;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::f64::consts::LN_2;
 use std::fs;
+use std::sync::OnceLock;
 use std::{
     env::{self, VarError},
     fs::{File, OpenOptions},
@@ -16,7 +16,7 @@ use std::{
 use stock_symbol::Symbol;
 use time::{OffsetDateTime, UtcOffset};
 
-static GLOBAL_CONFIG: OnceCell<Config> = OnceCell::new();
+static GLOBAL_CONFIG: OnceLock<Config> = OnceLock::new();
 
 const ALPACA_KEY_ID_ENV_VAR: &str = "ALPACA_KEY_ID";
 const ALPACA_SECRET_KEY_ENV_VAR: &str = "ALPACA_SECRET_KEY";
@@ -94,6 +94,7 @@ impl Config {
             },
             None => false,
         };
+        // let force_open = true;
 
         let me = Self {
             keys,
@@ -223,6 +224,8 @@ pub struct TradingConfig {
     pub max_position_count: usize,
     pub time_to_double: u32,
     pub minimum_position_equity_fraction: Decimal,
+    pub minimum_trade_equity_fraction: Decimal,
+    pub eta: f64,
 }
 
 impl TradingConfig {
@@ -243,6 +246,8 @@ impl Default for TradingConfig {
             max_position_count: 10,
             time_to_double: 250,
             minimum_position_equity_fraction: Decimal::new(5, 2),
+            minimum_trade_equity_fraction: Decimal::new(1, 2),
+            eta: 1.0,
         }
     }
 }

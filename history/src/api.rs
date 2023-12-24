@@ -6,7 +6,7 @@ use std::{
 use stock_symbol::Symbol;
 use time::OffsetDateTime;
 
-use entity::data::Bar;
+use entity::data::{Bar, SymbolMetadata};
 use rest::AlpacaRestApi;
 
 #[async_trait]
@@ -35,6 +35,8 @@ pub trait LocalHistory: Send + Sync + 'static {
     ) -> anyhow::Result<Vec<Bar>>;
 
     async fn get_symbol_avg_span(&self, symbol: Symbol) -> anyhow::Result<f64>;
+
+    async fn get_metadata(&self) -> anyhow::Result<HashMap<Symbol, SymbolMetadata>>;
 
     async fn refresh_connection(&mut self) -> anyhow::Result<()>;
 }

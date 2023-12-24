@@ -6,7 +6,6 @@ use std::{
 };
 
 use log::{warn, LevelFilter};
-use num_traits::ToPrimitive;
 use once_cell::sync::Lazy;
 use rust_decimal::{prelude::FromPrimitive, Decimal};
 use serde::{
@@ -33,7 +32,7 @@ pub fn f64_to_decimal(float: f64) -> Result<Decimal, DecimalConversionError> {
 
 #[inline]
 pub fn decimal_to_f64(x: Decimal) -> f64 {
-    x.round_dp(9).to_f64().unwrap_or_else(|| {
+    x.round_dp(9).try_into().unwrap_or_else(|_| {
         warn!("Failed to convert {x} to f64");
         f64::NAN
     })

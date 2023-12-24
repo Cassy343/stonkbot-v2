@@ -6,7 +6,6 @@ mod entry;
 mod orders;
 mod portfolio;
 mod positions;
-mod stat;
 mod trailing;
 
 pub async fn run(events: EventReceiver, rest: AlpacaRestApi, stream: StreamRequestSender) {

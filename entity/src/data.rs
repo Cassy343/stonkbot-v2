@@ -34,3 +34,10 @@ pub struct LossyBar {
     #[serde(rename = "v")]
     pub volume: u64,
 }
+
+#[derive(Debug, Clone, Copy)]
+pub struct SymbolMetadata {
+    pub average_span: f64,
+    pub median_volume: i64,
+    pub performance: f64,
+}

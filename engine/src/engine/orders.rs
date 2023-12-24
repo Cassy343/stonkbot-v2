@@ -68,10 +68,41 @@ impl OrderManager {
             .unwrap_or(TradeStatus::Untraded)
     }
 
-    pub async fn sell(&mut self, symbol: Symbol) -> anyhow::Result<()> {
+    pub async fn liquidate(&mut self, symbol: Symbol) -> anyhow::Result<()> {
         let order = self.rest.liquidate_position(symbol).await?;
         debug!(
             "Submitted order {} to liquidate position in {symbol}",
+            order.id.hyphenated()
+        );
+        self.trade_statuses
+            .insert(symbol, TradeStatus::OrderPending);
+        self.open_orders.push(OrderMeta::from(order));
+        Ok(())
+    }
+
+    pub async fn sell(&mut self, symbol: Symbol, notional: Decimal) -> anyhow::Result<()> {
+        let order = self
+            .rest
+            .submit_order(&OrderRequest {
+                symbol,
+                qty: None,
+                notional: Some(notional.round_dp_with_strategy(2, RoundingStrategy::ToZero)),
+                side: OrderSide::Sell,
+                order_type: OrderType::Market,
+                time_in_force: OrderTimeInForce::Day,
+                limit_price: None,
+                stop_price: None,
+                trail_price: None,
+                trail_percent: None,
+                extended_hours: None,
+                client_order_id: None,
+                order_class: None,
+                take_profit: None,
+                stop_loss: None,
+            })
+            .await?;
+        debug!(
+            "Submitted order {} to sell ${notional} of {symbol}",
             order.id.hyphenated()
         );
         self.trade_statuses

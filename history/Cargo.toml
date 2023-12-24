@@ -7,19 +7,19 @@ edition = "2021"
 common = { path = "../common" }
 entity = { path = "../entity" }
 rest = { path = "../rest" }
-anyhow = "1.0.58"
-async-trait = "0.1.57"
-futures = "0.3.21"
-log = "0.4.17"
+anyhow = "1.0.76"
+async-trait = "0.1.75"
+futures = "0.3.30"
+log = "0.4.20"
 
 [dependencies.sqlx]
-version = "0.6.1"
-features = ["runtime-tokio-rustls", "sqlite"]
+version = "0.7.3"
+features = ["runtime-tokio", "tls-rustls", "sqlite"]
 
 [dependencies.stock-symbol]
-version = "0.3.1"
+version = "0.4.0"
 features = ["sqlx"]
 
 [dependencies.time]
-version = "0.3.11"
+version = "0.3.31"
 features = []

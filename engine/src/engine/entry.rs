@@ -63,17 +63,24 @@ impl Engine {
             self.flush_trigger_batch().await?;
         }
 
+        match self.clock_info.duration_until_close {
+            Some(duration) => {
+                if duration < Duration::minutes(5) {
+                    let candidates = self.intraday.entry_strategy.candidates.clone();
+                    for symbol in candidates {
+                        self.entry_strat_buy_trigger(symbol);
+                    }
+                }
+            }
+            None => (),
+        }
+
         Ok(())
     }
 
     async fn resolve_candidates(&mut self) {
         let pm = &self.intraday.portfolio_manager;
-        let new_candidates = pm
-            .candidates()
-            .iter()
-            .map(|candidate| candidate.symbol)
-            .chain(pm.aux_candidates().into_iter().copied())
-            .collect::<BTreeSet<_>>();
+        let new_candidates = pm.candidates().collect::<BTreeSet<_>>();
 
         if new_candidates != self.intraday.entry_strategy.candidates {
             debug!("Entry strategy candidates: {new_candidates:?}");
@@ -146,11 +153,14 @@ impl Engine {
         let optimal_equities = self.portfolio_manager_optimal_equity(&selection)?;
         let mut cash = self.portfolio_manager_available_cash();
 
+        debug!("Cash: {cash}");
+
+        let min_trade = self.portfolio_manager_minimum_trade();
         for (symbol, optimal_equity) in selection.into_iter().zip(optimal_equities) {
             let notional = Decimal::min(optimal_equity, cash);
 
-            if notional <= Decimal::ONE {
-                trace!("Trigger for {symbol} ignored; notional amount {notional:.2} is less than threshold");
+            if notional <= min_trade {
+                trace!("Trigger for {symbol} ignored; notional amount {notional:.2} is less than threshold of {min_trade:.2}");
                 continue;
             }
 
