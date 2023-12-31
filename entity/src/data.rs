@@ -40,4 +40,5 @@ pub struct SymbolMetadata {
     pub average_span: f64,
     pub median_volume: i64,
     pub performance: f64,
+    pub last_close: f64,
 }

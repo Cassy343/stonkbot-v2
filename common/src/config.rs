@@ -111,6 +111,17 @@ impl Config {
             .map_err(|_| anyhow!("Config already initialized"))
     }
 
+    pub fn mwu_multiplier(change_percent: f64) -> f64 {
+        if !change_percent.is_finite() {
+            return 0.5;
+        }
+
+        let clamped_return = (1.0 + change_percent / 100.0).min(1.0 / 0.95).max(0.95);
+
+        // exp(-eta * -ln(r))
+        f64::powf(clamped_return, Self::get().trading.eta)
+    }
+
     pub fn localize(datetime: OffsetDateTime) -> OffsetDateTime {
         datetime.to_offset(Self::get().utc_offset.get())
     }

@@ -1,8 +1,9 @@
 use std::{cmp::Reverse, collections::HashMap};
 
 use anyhow::Context;
-use common::util::TotalF64;
+use common::util::{decimal_to_f64, TotalF64};
 use common::{config::Config, util::f64_to_decimal};
+use entity::data::SymbolMetadata;
 use entity::trading::AssetStatus;
 use history::LocalHistory;
 use log::{debug, error};
@@ -11,18 +12,19 @@ use serde::Serialize;
 use stock_symbol::Symbol;
 
 use super::engine_impl::Engine;
+use super::trailing::PriceInfo;
 
 #[derive(Serialize)]
 pub struct PortfolioManager {
-    candidates: HashMap<Symbol, f64>,
-    phi: f64,
+    candidates: HashMap<Symbol, PortfolioSymbolMeta>,
+    starting_cash: Decimal,
 }
 
 impl PortfolioManager {
     pub fn new() -> Self {
         Self {
             candidates: HashMap::new(),
-            phi: 0.0,
+            starting_cash: Decimal::ZERO,
         }
     }
 
@@ -32,23 +34,39 @@ impl PortfolioManager {
 }
 
 impl Engine {
+    fn latest_weights(&self) -> (HashMap<Symbol, f64>, f64) {
+        let pm = &self.intraday.portfolio_manager;
+        let mut weights = HashMap::with_capacity(pm.candidates.len());
+        let mut phi = 0.0;
+
+        for (&symbol, &meta) in &pm.candidates {
+            let multiplier = match self.intraday.price_tracker.price_info(symbol) {
+                Some(PriceInfo { latest_price, .. }) => {
+                    // TODO: consider using non-volatile price?
+                    let latest_price = decimal_to_f64(latest_price);
+                    let change_percent = 100.0 * (latest_price / meta.last_close - 1.0);
+                    Config::mwu_multiplier(change_percent)
+                }
+                None => 1.0,
+            };
+
+            let weight = meta.weight * multiplier;
+            phi += weight;
+            weights.insert(symbol, weight);
+        }
+
+        (weights, phi)
+    }
+
     pub fn portfolio_manager_optimal_equity(
         &mut self,
         symbols: &[Symbol],
     ) -> anyhow::Result<Vec<Decimal>> {
-        log::debug!("Symbols: {symbols:?}");
-
-        let pm = &mut self.intraday.portfolio_manager;
-
+        let (weights, phi) = self.latest_weights();
         let fractions = symbols
             .iter()
-            .map(|symbol| {
-                let w = pm.candidates.get(symbol).copied();
-                log::debug!("Weight of {symbol}: {w:?}");
-                w.unwrap_or(0.0) / pm.phi
-            })
+            .map(|symbol| weights.get(symbol).copied().unwrap_or(0.0) / phi)
             .collect::<Vec<_>>();
-
         let config = Config::get();
 
         let mut equities = Vec::with_capacity(symbols.len());
@@ -122,17 +140,52 @@ impl Engine {
 
         let mut by_performance = metadata
             .into_iter()
-            .map(|(symbol, meta)| (symbol, meta.performance))
+            .map(|(symbol, meta)| (symbol, PortfolioSymbolMeta::from(meta)))
             .collect::<Vec<_>>();
-        by_performance.sort_unstable_by_key(|&(_, w)| Reverse(TotalF64(w)));
+        by_performance.sort_unstable_by_key(|&(_, w)| Reverse(TotalF64(w.weight)));
 
         let pm = &mut self.intraday.portfolio_manager;
         pm.candidates = by_performance
             .into_iter()
             .take(config.trading.max_position_count)
             .collect();
-        pm.phi = pm.candidates.values().sum();
+
+        // TODO: remove debug information
+        pm.starting_cash = self.intraday.last_account.cash;
 
         Ok(())
+    }
+
+    pub fn portfolio_manager_on_close(&self) {
+        let mut weight_dict = String::from("{");
+        for (symbol, meta) in &self.intraday.portfolio_manager.candidates {
+            weight_dict.push_str(&format!("'{symbol}':{},", meta.weight));
+        }
+        if weight_dict.len() > 1 {
+            weight_dict.pop();
+        }
+        weight_dict.push('}');
+        debug!("Weight dict: {weight_dict}");
+
+        let acc = &self.intraday.last_account;
+        let actual_return = (acc.equity - acc.cash)
+            / (acc.last_equity - self.intraday.portfolio_manager.starting_cash);
+
+        debug!("Actual Return: {actual_return}");
+    }
+}
+
+#[derive(Clone, Copy, Serialize)]
+struct PortfolioSymbolMeta {
+    weight: f64,
+    last_close: f64,
+}
+
+impl From<SymbolMetadata> for PortfolioSymbolMeta {
+    fn from(meta: SymbolMetadata) -> Self {
+        Self {
+            weight: meta.performance,
+            last_close: meta.last_close,
+        }
     }
 }

@@ -273,6 +273,10 @@ impl Engine {
         }
 
         self.intraday.price_tracker.clear();
+
+        // TODO: remove debug output here
+        let _ = self.update_account_info();
+        self.portfolio_manager_on_close();
     }
 
     pub async fn get_avg_span(&mut self, symbol: Symbol) -> f64 {

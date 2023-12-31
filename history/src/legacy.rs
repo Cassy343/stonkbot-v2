@@ -64,7 +64,8 @@ impl SqliteLocalHistory {
                 symbol varchar(8),
                 avg_span FLOAT,
                 median_volume int(4),
-                performance FLOAT
+                performance FLOAT,
+                last_close FLOAT
             );
             ",
         )
@@ -147,8 +148,8 @@ impl SqliteLocalHistory {
             }
 
             past_market_day += 1;
+            num_updates += 1;
             if let Some(max_updates) = max_updates.map(NonZeroUsize::get) {
-                num_updates += 1;
                 if num_updates >= max_updates {
                     break;
                 }
@@ -250,6 +251,7 @@ impl SqliteLocalHistory {
                         average_span: 0.1,
                         median_volume: 0,
                         performance: 1.0,
+                        last_close: 1.0,
                     },
                 },
             );
@@ -308,19 +310,19 @@ impl SqliteLocalHistory {
         }
         drop(period_day_data_stream);
 
-        let mut metadata_stream =
-            sqlx::query("SELECT symbol,avg_span,median_volume,performance FROM CS_Metadata")
-                .fetch(&self.connection_pool);
+        let mut metadata_stream = sqlx::query(
+            "SELECT symbol,avg_span,median_volume,performance,last_close FROM CS_Metadata",
+        )
+        .fetch(&self.connection_pool);
         while let Some(row) = metadata_stream.next().await.transpose()? {
             let symbol: Symbol = row.try_get("symbol")?;
             match all_indicator_data.get_mut(&symbol) {
                 Some(indicator_data) => {
-                    let performance = row.try_get("performance")?;
-                    log::debug!("performance of {symbol} is {performance}");
                     indicator_data.metadata = SymbolMetadata {
                         average_span: row.try_get("avg_span")?,
                         median_volume: row.try_get("median_volume")?,
-                        performance,
+                        performance: row.try_get("performance")?,
+                        last_close: row.try_get("last_close")?,
                     };
                 }
                 None => {
@@ -532,12 +534,13 @@ impl SqliteLocalHistory {
         for (symbol, symbol_meta) in metadata.drain() {
             let update_meta_result = sqlx::query(
                 "
-                UPDATE CS_Metadata SET avg_span=?,median_volume=?,performance=? WHERE symbol=?
+                UPDATE CS_Metadata SET avg_span=?,median_volume=?,performance=?,last_close=? WHERE symbol=?
                 ",
             )
             .bind(symbol_meta.average_span)
             .bind(symbol_meta.median_volume)
             .bind(symbol_meta.performance)
+            .bind(symbol_meta.last_close)
             .bind(symbol.as_str())
             .execute(&self.connection_pool)
             .await;
@@ -726,14 +729,12 @@ impl SqliteLocalHistory {
         /* Metadata */
         /************/
 
-        let eta = Config::get().trading.eta;
-        let loss = if override_error {
-            1.0 / eta
+        let mul = if override_error {
+            1.0
         } else {
-            let clamped_return = (1.0 + change_percent / 100.0).min(1.0 / 0.95).max(0.95);
-            -f64::ln(clamped_return)
+            Config::mwu_multiplier(change_percent)
         };
-        let performance = indicator_data.metadata.performance * f64::exp(-eta * loss);
+        let performance = indicator_data.metadata.performance * mul;
 
         let low = day_data.low;
         let span = if low == 0.0 {
@@ -785,6 +786,7 @@ impl SqliteLocalHistory {
             average_span,
             median_volume,
             performance,
+            last_close: day_data.close,
         };
 
         (insert_indicators, symbol_meta)
@@ -857,6 +859,7 @@ impl SqliteLocalHistory {
             return Ok(());
         }
 
+        let mut performance = 1.0;
         let indicator_start_index = bars.len() - lead_time;
         for (index, bar) in bars.iter().enumerate().skip(1) {
             let prev_close = bars[index - 1].close;
@@ -865,6 +868,8 @@ impl SqliteLocalHistory {
             } else {
                 100.0 * (bar.close - prev_close) / prev_close
             };
+
+            performance *= Config::mwu_multiplier(change_percent);
 
             let pulldate = bar.time.unix_timestamp() / SECONDS_TO_DAYS;
             sqlx::query(
@@ -927,13 +932,17 @@ impl SqliteLocalHistory {
         volumes.sort_unstable();
         let median_volume = volumes[volumes.len() / 2];
 
+        let last_close = bars.last().unwrap().close;
+
         sqlx::query(
-            "INSERT INTO CS_Metadata (symbol,avg_span,median_volume,performance) VALUES (?,?,?,?)",
+            "INSERT INTO CS_Metadata (symbol,avg_span,median_volume,performance,last_close) \
+            VALUES (?,?,?,?,?)",
         )
         .bind(symbol.as_str())
         .bind(span_sum / tail.len() as f64)
         .bind(median_volume as i64)
-        .bind(1.0)
+        .bind(performance)
+        .bind(last_close)
         .execute(&self.connection_pool)
         .await?;
 
@@ -1167,14 +1176,14 @@ impl LocalHistory for SqliteLocalHistory {
     }
 
     async fn get_metadata(&self) -> anyhow::Result<HashMap<Symbol, SymbolMetadata>> {
-        let mut meta_iter = sqlx::query_as::<_, (Symbol, f64, i64, f64)>(
-            "SELECT symbol,avg_span,median_volume,performance FROM CS_Metadata",
+        let mut meta_iter = sqlx::query_as::<_, (Symbol, f64, i64, f64, f64)>(
+            "SELECT symbol,avg_span,median_volume,performance,last_close FROM CS_Metadata",
         )
         .fetch(&self.connection_pool);
 
         let mut meta = HashMap::new();
 
-        while let Some((symbol, average_span, median_volume, performance)) =
+        while let Some((symbol, average_span, median_volume, performance, last_close)) =
             meta_iter.next().await.transpose()?
         {
             meta.insert(
@@ -1183,6 +1192,7 @@ impl LocalHistory for SqliteLocalHistory {
                     average_span,
                     median_volume,
                     performance,
+                    last_close,
                 },
             );
         }

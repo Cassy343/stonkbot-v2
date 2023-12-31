@@ -42,6 +42,7 @@ impl EntryStrategy {
 impl Engine {
     pub async fn entry_strat_on_open(&mut self) {
         self.intraday.entry_strategy.candidates.clear();
+        self.intraday.entry_strategy.trigger_batch.clear();
         self.resolve_candidates().await;
         let subscribing = self
             .intraday
@@ -66,10 +67,8 @@ impl Engine {
         match self.clock_info.duration_until_close {
             Some(duration) => {
                 if duration < Duration::minutes(5) {
-                    let candidates = self.intraday.entry_strategy.candidates.clone();
-                    for symbol in candidates {
-                        self.entry_strat_buy_trigger(symbol);
-                    }
+                    self.execute_buy_trigger(self.intraday.entry_strategy.candidates.clone())
+                        .await?;
                 }
             }
             None => (),
@@ -110,6 +109,11 @@ impl Engine {
                 },
             )
             .collect::<Vec<_>>();
+
+        if batch.is_empty() {
+            return Ok(());
+        }
+
         batch.sort_by_key(|&(_, staleness)| staleness);
         self.execute_buy_trigger(batch.into_iter().map(|(symbol, _)| symbol))
             .await
@@ -132,14 +136,17 @@ impl Engine {
         let mut selection = Vec::with_capacity(remaining_position_slots);
 
         for symbol in symbols {
+            if self.intraday.last_position_map.contains_key(&symbol) {
+                continue;
+            }
+
             if !self
                 .intraday
                 .order_manager
                 .trade_status(symbol)
                 .is_buy_daytrade_safe()
-                || self.intraday.last_position_map.contains_key(&symbol)
             {
-                trace!("Trigger for {symbol} ignored due to trade status or no candidacy.");
+                trace!("Trigger for {symbol} ignored due to trade status.");
                 continue;
             }
 
@@ -152,8 +159,6 @@ impl Engine {
 
         let optimal_equities = self.portfolio_manager_optimal_equity(&selection)?;
         let mut cash = self.portfolio_manager_available_cash();
-
-        debug!("Cash: {cash}");
 
         let min_trade = self.portfolio_manager_minimum_trade();
         for (symbol, optimal_equity) in selection.into_iter().zip(optimal_equities) {
