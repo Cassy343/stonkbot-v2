@@ -1,6 +1,7 @@
 mod engine;
 mod event;
 mod logging;
+mod portfolio;
 
 use anyhow::Context;
 use common::config::Config;

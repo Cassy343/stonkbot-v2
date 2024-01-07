@@ -2,7 +2,7 @@ use std::{collections::HashMap, time::Duration};
 
 use anyhow::Context;
 use entity::trading::{Order, OrderRequest, OrderSide, OrderTimeInForce, OrderType};
-use log::debug;
+use log::info;
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde::Serialize;
 use stock_symbol::Symbol;
@@ -70,7 +70,7 @@ impl OrderManager {
 
     pub async fn liquidate(&mut self, symbol: Symbol) -> anyhow::Result<()> {
         let order = self.rest.liquidate_position(symbol).await?;
-        debug!(
+        info!(
             "Submitted order {} to liquidate position in {symbol}",
             order.id.hyphenated()
         );
@@ -101,8 +101,8 @@ impl OrderManager {
                 stop_loss: None,
             })
             .await?;
-        debug!(
-            "Submitted order {} to sell ${notional} of {symbol}",
+        info!(
+            "Submitted order {} to sell ${notional:.2} of {symbol}",
             order.id.hyphenated()
         );
         self.trade_statuses
@@ -132,8 +132,8 @@ impl OrderManager {
                 stop_loss: None,
             })
             .await?;
-        debug!(
-            "Submitted order {} to buy ${notional} of {symbol}",
+        info!(
+            "Submitted order {} to buy ${notional:.2} of {symbol}",
             order.id.hyphenated()
         );
         self.trade_statuses

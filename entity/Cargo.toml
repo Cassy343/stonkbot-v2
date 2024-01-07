@@ -5,8 +5,6 @@ edition = "2021"
 
 [dependencies]
 serde_json = "1.0.108"
-serde_with = "3.4.0"
-common = { path = "../common" }
 
 [dependencies.rust_decimal]
 version = "1.33.1"

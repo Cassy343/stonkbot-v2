@@ -36,9 +36,17 @@ pub struct LossyBar {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct SymbolMetadata {
+pub struct LossySymbolMetadata {
     pub average_span: f64,
     pub median_volume: i64,
     pub performance: f64,
     pub last_close: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SymbolMetadata {
+    pub average_span: Decimal,
+    pub median_volume: i64,
+    pub performance: Decimal,
+    pub last_close: Decimal,
 }

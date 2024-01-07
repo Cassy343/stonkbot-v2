@@ -3,11 +3,17 @@ use std::{
     num::NonZeroUsize,
 };
 
+use crate::Timeframe;
+
 use super::LocalHistory;
-use ::entity::data::{Bar, LossyBar, SymbolMetadata};
+use ::entity::data::{Bar, LossyBar, LossySymbolMetadata, SymbolMetadata};
+use anyhow::anyhow;
 use async_trait::async_trait;
-use common::config::{Config, IndicatorPeriodConfig};
 use common::util::{f64_to_decimal, SECONDS_TO_DAYS};
+use common::{
+    config::{Config, IndicatorPeriodConfig},
+    mwu::Delta,
+};
 use futures::{executor::block_on, StreamExt};
 use log::{error, info, warn};
 use rest::AlpacaRestApi;
@@ -17,10 +23,12 @@ use sqlx::{
 use std::collections::HashSet;
 use stock_symbol::Symbol;
 use time::{Date, Duration, OffsetDateTime};
+use tokio::sync::Mutex;
 
 pub struct SqliteLocalHistory {
     database_file: String,
     connection_pool: SqlitePool,
+    pulldates: Mutex<Option<Vec<i64>>>,
 }
 
 impl SqliteLocalHistory {
@@ -75,6 +83,7 @@ impl SqliteLocalHistory {
         Ok(SqliteLocalHistory {
             database_file: database_file.to_owned(),
             connection_pool: pool,
+            pulldates: Mutex::new(None),
         })
     }
 
@@ -86,6 +95,25 @@ impl SqliteLocalHistory {
                 .into_iter()
                 .map(|symbol_row| symbol_row.0),
         )
+    }
+
+    async fn pulldates(&self) -> Result<Vec<i64>, SqlxError> {
+        let mut cache = self.pulldates.lock().await;
+        let ret = if cache.is_some() {
+            cache.as_ref().unwrap().clone()
+        } else {
+            let mut pulldates_stream = sqlx::query_as::<_, (i64,)>(
+                "SELECT distinct(pulldate) FROM CS_Day ORDER BY pulldate DESC",
+            )
+            .fetch(&self.connection_pool);
+            let mut pulldates = Vec::new();
+            while let Some((pulldate,)) = pulldates_stream.next().await.transpose()? {
+                pulldates.push(pulldate);
+            }
+            *cache = Some(pulldates.clone());
+            pulldates
+        };
+        Ok(ret)
     }
 
     pub async fn update_history_to_present(
@@ -247,7 +275,7 @@ impl SqliteLocalHistory {
                     avg_loss: row.try_get("avgLoss")?,
                     dx_desc: Vec::with_capacity(indicator_periods.adx - 2),
                     period_day_data_desc: Vec::with_capacity(max_indicator_period),
-                    metadata: SymbolMetadata {
+                    metadata: LossySymbolMetadata {
                         average_span: 0.1,
                         median_volume: 0,
                         performance: 1.0,
@@ -318,7 +346,7 @@ impl SqliteLocalHistory {
             let symbol: Symbol = row.try_get("symbol")?;
             match all_indicator_data.get_mut(&symbol) {
                 Some(indicator_data) => {
-                    indicator_data.metadata = SymbolMetadata {
+                    indicator_data.metadata = LossySymbolMetadata {
                         average_span: row.try_get("avg_span")?,
                         median_volume: row.try_get("median_volume")?,
                         performance: row.try_get("performance")?,
@@ -336,7 +364,7 @@ impl SqliteLocalHistory {
         drop(metadata_stream);
 
         let mut transaction = self.connection_pool.begin().await?;
-        let mut metadata: HashMap<Symbol, SymbolMetadata> = HashMap::new();
+        let mut metadata: HashMap<Symbol, LossySymbolMetadata> = HashMap::new();
 
         // Filter the bars which have valid data and whose symbols are already in the record
         // Note: all unwraps on bar fields in this loop are safe since the bars are checked by the filter
@@ -574,7 +602,7 @@ impl SqliteLocalHistory {
         override_error: bool,
     ) -> (
         Query<'a, Sqlite, <Sqlite as HasArguments<'a>>::Arguments>,
-        SymbolMetadata,
+        LossySymbolMetadata,
     ) {
         // These will be used multiple times during computation
         #[allow(clippy::needless_late_init)]
@@ -732,7 +760,7 @@ impl SqliteLocalHistory {
         let mul = if override_error {
             1.0
         } else {
-            Config::mwu_multiplier(change_percent)
+            Config::mwu_multiplier(Delta::ChangePercent(change_percent))
         };
         let performance = indicator_data.metadata.performance * mul;
 
@@ -782,7 +810,7 @@ impl SqliteLocalHistory {
         // Stochastic oscillator
         .bind(so);
 
-        let symbol_meta = SymbolMetadata {
+        let symbol_meta = LossySymbolMetadata {
             average_span,
             median_volume,
             performance,
@@ -869,7 +897,7 @@ impl SqliteLocalHistory {
                 100.0 * (bar.close - prev_close) / prev_close
             };
 
-            performance *= Config::mwu_multiplier(change_percent);
+            performance *= Config::mwu_multiplier(Delta::ChangePercent(change_percent));
 
             let pulldate = bar.time.unix_timestamp() / SECONDS_TO_DAYS;
             sqlx::query(
@@ -995,7 +1023,7 @@ impl Drop for SqliteLocalHistory {
 
 // Structs for storing related data together
 mod entity {
-    use super::SymbolMetadata;
+    use entity::data::LossySymbolMetadata;
 
     pub struct IndicatorDataInput {
         pub obv: i64,
@@ -1007,7 +1035,7 @@ mod entity {
         pub avg_loss: f64,
         pub dx_desc: Vec<f64>,
         pub period_day_data_desc: Vec<DayDataInput>,
-        pub metadata: SymbolMetadata,
+        pub metadata: LossySymbolMetadata,
     }
 
     pub struct DayDataInput {
@@ -1036,17 +1064,30 @@ mod entity {
 }
 
 impl SqliteLocalHistory {
-    fn timeframe_to_pulldates(start: OffsetDateTime, end: Option<OffsetDateTime>) -> (i64, i64) {
-        let start_pulldate = start.unix_timestamp() / SECONDS_TO_DAYS;
-        let end_pulldate = end
-            .map(|datetime| datetime.unix_timestamp() / SECONDS_TO_DAYS)
-            .unwrap_or_else(|| {
-                // We add 2 here to avoid timezone weirdness. This pulldate should be greater than
-                // any pulldate in the database.
-                OffsetDateTime::now_utc().unix_timestamp() / SECONDS_TO_DAYS + 2
-            });
+    async fn timeframe_to_pulldates(&self, timeframe: Timeframe) -> anyhow::Result<(i64, i64)> {
+        // We add 2 here to avoid timezone weirdness. This pulldate should be greater than
+        // any pulldate in the database.
+        let default_end_pulldate = OffsetDateTime::now_utc().unix_timestamp() / SECONDS_TO_DAYS + 2;
 
-        (start_pulldate, end_pulldate)
+        match timeframe {
+            Timeframe::After(start) => Ok((
+                start.unix_timestamp() / SECONDS_TO_DAYS,
+                default_end_pulldate,
+            )),
+            Timeframe::Within { start, end } => Ok((
+                start.unix_timestamp() / SECONDS_TO_DAYS,
+                end.unix_timestamp() / SECONDS_TO_DAYS,
+            )),
+            Timeframe::DaysBeforeNow(days) => {
+                let pulldates = self.pulldates().await?;
+
+                if days == 0 || days > pulldates.len() {
+                    return Err(anyhow!("Days before now out of range"));
+                }
+
+                Ok((pulldates[days - 1], default_end_pulldate))
+            }
+        }
     }
 
     fn pohlcv_to_bar(
@@ -1089,20 +1130,21 @@ impl LocalHistory for SqliteLocalHistory {
         rest: &AlpacaRestApi,
         max_updates: Option<NonZeroUsize>,
     ) -> anyhow::Result<()> {
+        *self.pulldates.lock().await = None;
         SqliteLocalHistory::update_history_to_present(self, rest, max_updates).await
     }
 
     async fn repair_records(&self, rest: &AlpacaRestApi, symbols: &[Symbol]) -> anyhow::Result<()> {
+        *self.pulldates.lock().await = None;
         self.repair_records(rest, symbols, &Config::get().indicator_periods)
             .await
     }
 
     async fn get_market_history(
         &self,
-        start: OffsetDateTime,
-        end: Option<OffsetDateTime>,
+        timeframe: Timeframe,
     ) -> anyhow::Result<HashMap<Symbol, Vec<Bar>>> {
-        let (start_pulldate, end_pulldate) = Self::timeframe_to_pulldates(start, end);
+        let (start_pulldate, end_pulldate) = self.timeframe_to_pulldates(timeframe).await?;
         let estimated_capacity = usize::try_from(end_pulldate - start_pulldate)?;
 
         let mut last_market_day_data_stream =
@@ -1139,10 +1181,9 @@ impl LocalHistory for SqliteLocalHistory {
     async fn get_symbol_history(
         &self,
         symbol: Symbol,
-        start: OffsetDateTime,
-        end: Option<OffsetDateTime>,
+        timeframe: Timeframe,
     ) -> anyhow::Result<Vec<Bar>> {
-        let (start_pulldate, end_pulldate) = Self::timeframe_to_pulldates(start, end);
+        let (start_pulldate, end_pulldate) = self.timeframe_to_pulldates(timeframe).await?;
 
         let mut last_market_day_data_stream = sqlx::query_as::<_, (i64, f64, f64, f64, f64, i64)>(
             "SELECT pulldate,open,high,low,close,volume \
@@ -1189,10 +1230,10 @@ impl LocalHistory for SqliteLocalHistory {
             meta.insert(
                 symbol,
                 SymbolMetadata {
-                    average_span,
+                    average_span: f64_to_decimal(average_span)?,
                     median_volume,
-                    performance,
-                    last_close,
+                    performance: f64_to_decimal(performance)?,
+                    last_close: f64_to_decimal(last_close)?,
                 },
             );
         }

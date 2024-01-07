@@ -1,9 +1,12 @@
+use crate::mwu::{mwu_multiplier, AsReturn, Delta, WeightUpdate};
 use crate::util::SerdeLevelFilter;
 use anyhow::{anyhow, Context};
 use log::LevelFilter;
 use rust_decimal::Decimal;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::f64::consts::LN_2;
+use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::sync::OnceLock;
 use std::{
@@ -31,6 +34,7 @@ pub struct Config {
     pub utc_offset: LocalOffset,
     pub force_open: bool,
     pub log_level_filter: LevelFilter,
+    extra: HashMap<String, Value>,
 }
 
 impl Config {
@@ -94,7 +98,6 @@ impl Config {
             },
             None => false,
         };
-        // let force_open = true;
 
         let me = Self {
             keys,
@@ -104,6 +107,7 @@ impl Config {
             utc_offset,
             force_open,
             log_level_filter: on_disk_config.log_level_filter,
+            extra: on_disk_config.extra,
         };
 
         GLOBAL_CONFIG
@@ -111,19 +115,40 @@ impl Config {
             .map_err(|_| anyhow!("Config already initialized"))
     }
 
-    pub fn mwu_multiplier(change_percent: f64) -> f64 {
-        if !change_percent.is_finite() {
-            return 0.5;
-        }
-
-        let clamped_return = (1.0 + change_percent / 100.0).min(1.0 / 0.95).max(0.95);
-
-        // exp(-eta * -ln(r))
-        f64::powf(clamped_return, Self::get().trading.eta)
+    pub fn mwu_multiplier<T>(delta: Delta<T>) -> T
+    where
+        T: AsReturn + WeightUpdate<Decimal>,
+    {
+        mwu_multiplier(delta, Self::get().trading.eta)
     }
 
     pub fn localize(datetime: OffsetDateTime) -> OffsetDateTime {
         datetime.to_offset(Self::get().utc_offset.get())
+    }
+
+    pub fn extra<T>(key: &str) -> anyhow::Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        let config = Self::get();
+        let value = config
+            .extra
+            .get(key)
+            .ok_or_else(|| anyhow!("No config entry for key {key}"))?
+            .clone();
+        serde_json::from_value(value).map_err(Into::into)
+    }
+
+    pub fn extra_or_default<T>(key: &str) -> Result<T, serde_json::Error>
+    where
+        T: DeserializeOwned + Default,
+    {
+        let config = Self::get();
+        let value = match config.extra.get(key).cloned() {
+            Some(value) => value,
+            None => return Ok(T::default()),
+        };
+        serde_json::from_value(value)
     }
 }
 
@@ -226,39 +251,28 @@ impl<'de> Deserialize<'de> for LocalOffset {
 
 #[derive(Serialize, Deserialize)]
 pub struct TradingConfig {
-    pub sample_stock: Symbol,
     pub pre_open_hours_offset: u8,
     pub seconds_per_tick: u64,
-    pub max_hold_time: u32,
-    pub cash_buffer_factor: Decimal,
     pub minimum_median_volume: u64,
-    pub max_position_count: usize,
-    pub time_to_double: u32,
+    pub minimum_cash_fraction: Decimal,
     pub minimum_position_equity_fraction: Decimal,
     pub minimum_trade_equity_fraction: Decimal,
-    pub eta: f64,
-}
-
-impl TradingConfig {
-    pub fn baseline_return(&self) -> f64 {
-        (1.0 / self.time_to_double as f64) * LN_2
-    }
+    pub eta: Decimal,
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub blacklist: HashSet<Symbol>,
 }
 
 impl Default for TradingConfig {
     fn default() -> Self {
         TradingConfig {
-            sample_stock: Symbol::from_str("AAPL").unwrap(),
             pre_open_hours_offset: 3,
             seconds_per_tick: 10,
-            max_hold_time: 7,
-            cash_buffer_factor: Decimal::new(16, 0),
             minimum_median_volume: 750_000,
-            max_position_count: 10,
-            time_to_double: 250,
+            minimum_cash_fraction: Decimal::new(5, 2),
             minimum_position_equity_fraction: Decimal::new(5, 2),
             minimum_trade_equity_fraction: Decimal::new(1, 2),
-            eta: 1.0,
+            eta: Decimal::ONE,
+            blacklist: HashSet::new(),
         }
     }
 }
@@ -315,6 +329,8 @@ struct OnDiskConfig {
     utc_offset: Option<LocalOffset>,
     #[serde(with = "SerdeLevelFilter")]
     log_level_filter: LevelFilter,
+    #[serde(flatten)]
+    extra: HashMap<String, Value>,
 }
 
 impl OnDiskConfig {
@@ -335,6 +351,7 @@ impl Default for OnDiskConfig {
             indicator_periods: IndicatorPeriodConfig::default(),
             utc_offset: None,
             log_level_filter: LevelFilter::Trace,
+            extra: HashMap::new(),
         }
     }
 }

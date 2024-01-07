@@ -9,15 +9,13 @@ entity = { path = "../entity" }
 history = { path = "../history" }
 rest = { path = "../rest" }
 anyhow = "1.0.76"
+async-trait = "0.1.75"
+colored = "2.1.0"
 flate2 = "1.0.28"
 futures = "0.3.30"
 log = "0.4.20"
 rustyline = "13.0.0"
 serde_json = "1.0.108"
-serde_with = "3.4.0"
-
-[target.'cfg(unix)'.dependencies]
-termion = "2.0.3"
 
 [dependencies.log4rs]
 version = "1.2.0"

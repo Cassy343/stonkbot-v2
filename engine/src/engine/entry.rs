@@ -1,4 +1,3 @@
-use common::config::Config;
 use log::{debug, trace};
 use rust_decimal::Decimal;
 use serde::Serialize;
@@ -64,14 +63,9 @@ impl Engine {
             self.flush_trigger_batch().await?;
         }
 
-        match self.clock_info.duration_until_close {
-            Some(duration) => {
-                if duration < Duration::minutes(5) {
-                    self.execute_buy_trigger(self.intraday.entry_strategy.candidates.clone())
-                        .await?;
-                }
-            }
-            None => (),
+        if self.within_duration_of_close(Duration::seconds(30)) {
+            self.execute_buy_trigger(self.intraday.entry_strategy.candidates.clone())
+                .await?;
         }
 
         Ok(())
@@ -123,17 +117,11 @@ impl Engine {
         &mut self,
         symbols: impl IntoIterator<Item = Symbol>,
     ) -> anyhow::Result<()> {
-        let current_position_count = self.intraday.last_position_map.len();
-        let max_position_count = Config::get().trading.max_position_count;
-
-        // If we've hit our position limit then bail
-        if current_position_count >= max_position_count {
-            trace!("Buy trigger ignored; max position count hit.");
+        if !self.within_duration_of_close(Duration::minutes(195)) {
             return Ok(());
         }
 
-        let remaining_position_slots = max_position_count - current_position_count;
-        let mut selection = Vec::with_capacity(remaining_position_slots);
+        let mut selection = Vec::new();
 
         for symbol in symbols {
             if self.intraday.last_position_map.contains_key(&symbol) {
@@ -151,10 +139,6 @@ impl Engine {
             }
 
             selection.push(symbol);
-
-            if selection.len() >= remaining_position_slots {
-                break;
-            }
         }
 
         let optimal_equities = self.portfolio_manager_optimal_equity(&selection)?;

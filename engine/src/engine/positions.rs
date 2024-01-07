@@ -1,22 +1,18 @@
-use std::{collections::HashMap, path::Path};
+use std::collections::HashMap;
 
 use anyhow::anyhow;
 use entity::trading::Position;
-use log::{debug, trace};
+use log::{debug, info, trace};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use stock_symbol::Symbol;
-use time::{Duration, OffsetDateTime};
-use tokio::io::AsyncReadExt;
-use tokio::{fs::OpenOptions, io::AsyncWriteExt};
+use time::Duration;
 
 use crate::event::stream::StreamRequest;
-use history::LocalHistory;
+use history::{LocalHistory, Timeframe};
 
 use super::engine_impl::Engine;
 use anyhow::Context;
-
-const METADATA_FILE: &str = "position-metadata.json";
 
 #[derive(Serialize)]
 pub struct PositionManager {
@@ -24,55 +20,22 @@ pub struct PositionManager {
 }
 
 impl PositionManager {
-    pub async fn new() -> anyhow::Result<Self> {
-        let position_metadata_path = Path::new(METADATA_FILE);
-
-        let position_meta = if position_metadata_path.exists() {
-            let mut position_metadata_file = OpenOptions::new()
-                .read(true)
-                .write(false)
-                .open(position_metadata_path)
-                .await
-                .context("Failed to open position metadata file")?;
-
-            let mut buf = String::with_capacity(usize::try_from(
-                position_metadata_file.metadata().await?.len(),
-            )?);
-            position_metadata_file
-                .read_to_string(&mut buf)
-                .await
-                .context("Failed to read config file")?;
-
-            serde_json::from_str(&buf)
-                .with_context(|| format!("Failed to parse {METADATA_FILE}"))?
-        } else {
-            HashMap::new()
-        };
-
-        Ok(Self { position_meta })
+    pub fn new(meta: PositionManagerMetadata) -> Self {
+        Self {
+            position_meta: meta.position_meta,
+        }
     }
 
-    pub async fn save_metadata(&self) -> anyhow::Result<()> {
-        let mut position_metadata_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(Path::new(METADATA_FILE))
-            .await
-            .context("Failed to open position metadata file")?;
-
-        let buf = serde_json::to_string(&self.position_meta)
-            .context("Failed to serialize position meta")?;
-        position_metadata_file.write_all(buf.as_bytes()).await?;
-
-        Ok(())
+    pub fn into_metadata(self) -> PositionManagerMetadata {
+        PositionManagerMetadata {
+            position_meta: self.position_meta,
+        }
     }
 }
 
 impl Engine {
     pub async fn position_manager_on_pre_open(&mut self) -> anyhow::Result<()> {
-        debug!("Running position manager pre-open tasks");
+        info!("Running position manager pre-open tasks");
 
         let mut new_meta = HashMap::with_capacity(self.intraday.last_position_map.len());
         for position in self.intraday.last_position_map.values() {
@@ -89,11 +52,9 @@ impl Engine {
         &self,
         position: &Position,
     ) -> anyhow::Result<PositionMetadata> {
-        let now = OffsetDateTime::now_utc();
-        let start = now - Duration::days(7 * 6);
         let history = self
             .local_history
-            .get_symbol_history(position.symbol, start, None)
+            .get_symbol_history(position.symbol, Timeframe::DaysBeforeNow(30))
             .await?;
 
         if history.len() < 2 {
@@ -147,26 +108,31 @@ impl Engine {
     }
 
     pub async fn position_manager_on_tick(&mut self) -> anyhow::Result<()> {
-        match self.clock_info.duration_until_close {
-            Some(duration) if duration <= Duration::minutes(10) => {
-                let symbols = self
-                    .intraday
-                    .last_position_map
-                    .keys()
-                    .copied()
-                    .collect::<Vec<_>>();
-                for symbol in symbols {
-                    self.position_sell_trigger(symbol).await?;
+        if self.within_duration_of_close(Duration::seconds(45)) {
+            let within_30 = self.within_duration_of_close(Duration::seconds(30));
+            let symbols = self
+                .intraday
+                .last_position_map
+                .keys()
+                .copied()
+                .collect::<Vec<_>>();
+            for symbol in symbols {
+                // Sell slightly earlier to free up cash faster
+                self.position_sell_trigger(symbol).await?;
+                if within_30 {
                     self.position_buy_trigger(symbol).await?;
                 }
             }
-            _ => (),
         }
 
         Ok(())
     }
 
     pub async fn position_sell_trigger(&mut self, symbol: Symbol) -> anyhow::Result<()> {
+        if !self.within_duration_of_close(Duration::minutes(195)) {
+            return Ok(());
+        }
+
         // If selling would count as a day trade, then don't sell
         if !self
             .intraday
@@ -212,6 +178,10 @@ impl Engine {
     }
 
     pub async fn position_buy_trigger(&mut self, symbol: Symbol) -> anyhow::Result<()> {
+        if !self.within_duration_of_close(Duration::minutes(195)) {
+            return Ok(());
+        }
+
         if !self
             .intraday
             .order_manager
@@ -265,4 +235,9 @@ struct PositionMetadata {
     // probability of getting the expected positive return
     epr_prob: Decimal,
     hold_time: u32,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+pub struct PositionManagerMetadata {
+    position_meta: HashMap<Symbol, PositionMetadata>,
 }

@@ -1,3 +1,4 @@
+use colored::{Color, Colorize};
 use common::util;
 use flate2::{write::GzEncoder, Compression};
 use log::*;
@@ -26,19 +27,13 @@ use std::{
 };
 use time::OffsetDateTime;
 
-#[cfg(unix)]
-use termion::{color, cursor};
-
 const FILE_SIZE_LIMIT: u64 = 50_000_000;
 
 macro_rules! format_record {
-    ($writer:expr, $record:expr) => {{
-        let writer = $writer;
+    ($record:expr) => {{
         let record = $record;
         let location = Location::from_record(record);
-
-        writeln!(
-            writer,
+        format!(
             "[{} {}{}{}]: {}",
             format_time(current_time()),
             record.metadata().level(),
@@ -50,6 +45,21 @@ macro_rules! format_record {
             location,
             record.args()
         )
+    }};
+}
+
+macro_rules! write_record {
+    ($writer:expr, $record:expr, $color:expr) => {{
+        let writer = $writer;
+        let record = $record;
+        let color = $color;
+        writeln!(writer, "{}", format_record!(record).color(color))
+    }};
+
+    ($writer:expr, $record:expr) => {{
+        let writer = $writer;
+        let record = $record;
+        writeln!(writer, "{}", format_record!(record))
     }};
 }
 
@@ -147,24 +157,15 @@ impl<P: ExternalPrinter + Send + 'static> Append for CustomConsoleAppender<P> {
     fn append(&self, record: &Record) -> Result<(), anyhow::Error> {
         let mut writer = Cursor::new(Vec::<u8>::new());
 
-        #[cfg(unix)]
-        {
-            write!(writer, "{}", cursor::Up(1))?;
-            match record.metadata().level() {
-                Level::Error => write!(writer, "{}", color::Fg(color::Red))?,
-                Level::Warn => write!(writer, "{}", color::Fg(color::LightYellow))?,
-                Level::Debug => write!(writer, "{}", color::Fg(color::LightCyan))?,
-                Level::Trace => write!(writer, "{}", color::Fg(color::LightMagenta))?,
-                _ => write!(writer, "{}", color::Fg(color::Reset))?,
-            }
-        }
+        let color = match record.metadata().level() {
+            Level::Error => Color::Red,
+            Level::Warn => Color::Yellow,
+            Level::Debug => Color::BrightCyan,
+            Level::Trace => Color::BrightMagenta,
+            _ => Color::White,
+        };
 
-        format_record!(&mut writer, record)?;
-
-        #[cfg(unix)]
-        {
-            writeln!(writer, "{}", color::Fg(color::Reset))?;
-        }
+        write_record!(&mut writer, record, color)?;
 
         self.printer.lock().unwrap().print(
             String::from_utf8(writer.into_inner())
@@ -292,7 +293,7 @@ struct LogEncoder;
 
 impl Encode for LogEncoder {
     fn encode(&self, writer: &mut dyn encode::Write, record: &Record<'_>) -> anyhow::Result<()> {
-        format_record!(writer, record).map_err(Into::into)
+        write_record!(writer, record).map_err(Into::into)
     }
 }
 

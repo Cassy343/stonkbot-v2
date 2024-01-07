@@ -1,95 +1,163 @@
-use std::{cmp::Reverse, collections::HashMap};
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
 
-use anyhow::Context;
-use common::util::{decimal_to_f64, TotalF64};
-use common::{config::Config, util::f64_to_decimal};
-use entity::data::SymbolMetadata;
-use entity::trading::AssetStatus;
-use history::LocalHistory;
-use log::{debug, error};
+use anyhow::anyhow;
+use common::{
+    config::Config,
+    mwu::{mwu_multiplier, Delta},
+};
+use history::{LocalHistory, Timeframe};
+use log::{debug, error, info, warn};
 use rust_decimal::Decimal;
-use serde::Serialize;
+use serde::{Deserialize, Serialize, Serializer};
+use serde_json::Value;
 use stock_symbol::Symbol;
 
+use crate::portfolio::{make_long_portfolio, LongPortfolioStrategy};
+
 use super::engine_impl::Engine;
-use super::trailing::PriceInfo;
+
+const ETA: f64 = 0.5;
 
 #[derive(Serialize)]
 pub struct PortfolioManager {
-    candidates: HashMap<Symbol, PortfolioSymbolMeta>,
+    #[serde(serialize_with = "PortfolioManager::serialize_long")]
+    long: Vec<Rc<RefCell<dyn LongPortfolioStrategy>>>,
+    long_weights: Vec<Decimal>,
+    initial_long_fractions: HashMap<Symbol, Vec<Decimal>>,
     starting_cash: Decimal,
 }
 
 impl PortfolioManager {
-    pub fn new() -> Self {
-        Self {
-            candidates: HashMap::new(),
-            starting_cash: Decimal::ZERO,
+    pub fn new(meta: PortfolioManagerMetadata) -> anyhow::Result<Self> {
+        let long = make_long_portfolio()?;
+        let key_to_index = long
+            .iter()
+            .enumerate()
+            .map(|(index, strategy)| (RefCell::borrow(&**strategy).key(), index))
+            .collect::<HashMap<_, _>>();
+        let long_weights = long
+            .iter()
+            .map(|strategy| {
+                meta.long_weights
+                    .get(RefCell::borrow(strategy).key())
+                    .copied()
+                    .unwrap_or(Decimal::ONE)
+            })
+            .collect();
+        let mut initial_long_fractions = HashMap::with_capacity(meta.initial_long_fractions.len());
+        for (symbol, split) in meta.initial_long_fractions {
+            let vec_split = initial_long_fractions
+                .entry(symbol)
+                .or_insert_with(|| vec![Decimal::ZERO; long.len()]);
+            for (key, fraction) in split {
+                match key_to_index.get(&*key) {
+                    Some(&index) => {
+                        vec_split[index] = fraction;
+                    }
+                    None => {
+                        return Err(anyhow!(
+                            "Found invalid key {key} when initializing position manager"
+                        ))
+                    }
+                }
+            }
         }
+
+        Ok(Self {
+            long,
+            long_weights,
+            initial_long_fractions,
+            starting_cash: Decimal::ZERO,
+        })
+    }
+
+    fn serialize_long<S>(
+        long: &[Rc<RefCell<dyn LongPortfolioStrategy>>],
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let map = long
+            .iter()
+            .map(|strategy| {
+                let strategy = RefCell::borrow(strategy);
+                let key = strategy.key();
+                let value = match strategy.as_json_value() {
+                    Ok(value) => value,
+                    Err(error) => {
+                        error!("Failed to serialize data for portfolio strategy {key}: {error}");
+                        Value::Null
+                    }
+                };
+                (key, value)
+            })
+            .collect::<HashMap<_, _>>();
+        map.serialize(serializer)
     }
 
     pub fn candidates(&self) -> impl Iterator<Item = Symbol> + '_ {
-        self.candidates.keys().copied()
+        self.long
+            .iter()
+            .flat_map(|strategy| RefCell::borrow(strategy).candidates())
+    }
+
+    pub fn into_metadata(self) -> PortfolioManagerMetadata {
+        let keys = self
+            .long
+            .iter()
+            .map(|strategy| RefCell::borrow(&**strategy).key().to_owned())
+            .collect::<Vec<_>>();
+
+        PortfolioManagerMetadata {
+            long_weights: self
+                .long
+                .iter()
+                .map(|strategy| RefCell::borrow(&**strategy).key().to_owned())
+                .zip(self.long_weights)
+                .collect(),
+            initial_long_fractions: self
+                .initial_long_fractions
+                .into_iter()
+                .map(|(symbol, split)| (symbol, keys.clone().into_iter().zip(split).collect()))
+                .collect(),
+        }
     }
 }
 
 impl Engine {
-    fn latest_weights(&self) -> (HashMap<Symbol, f64>, f64) {
-        let pm = &self.intraday.portfolio_manager;
-        let mut weights = HashMap::with_capacity(pm.candidates.len());
-        let mut phi = 0.0;
-
-        for (&symbol, &meta) in &pm.candidates {
-            let multiplier = match self.intraday.price_tracker.price_info(symbol) {
-                Some(PriceInfo { latest_price, .. }) => {
-                    // TODO: consider using non-volatile price?
-                    let latest_price = decimal_to_f64(latest_price);
-                    let change_percent = 100.0 * (latest_price / meta.last_close - 1.0);
-                    Config::mwu_multiplier(change_percent)
-                }
-                None => 1.0,
-            };
-
-            let weight = meta.weight * multiplier;
-            phi += weight;
-            weights.insert(symbol, weight);
-        }
-
-        (weights, phi)
-    }
-
     pub fn portfolio_manager_optimal_equity(
         &mut self,
         symbols: &[Symbol],
     ) -> anyhow::Result<Vec<Decimal>> {
-        let (weights, phi) = self.latest_weights();
-        let fractions = symbols
-            .iter()
-            .map(|symbol| weights.get(symbol).copied().unwrap_or(0.0) / phi)
-            .collect::<Vec<_>>();
+        let pm = &self.intraday.portfolio_manager;
+        let phi = pm.long_weights.iter().sum::<Decimal>();
         let config = Config::get();
-
+        let total_equity = self.intraday.last_account.equity;
+        let usable_equity = (Decimal::ONE - config.trading.minimum_cash_fraction) * total_equity;
         let mut equities = Vec::with_capacity(symbols.len());
-        for fraction in fractions {
-            let fraction = match f64_to_decimal(fraction) {
-                Ok(f) => f,
-                Err(_) => {
-                    error!(
-                        "Failed to convert float fraction to decimal. Fraction: {:?}",
-                        fraction
-                    );
-                    equities.push(Decimal::ZERO);
-                    continue;
-                }
-            };
+
+        for &symbol in symbols {
+            let fraction = self
+                .intraday
+                .portfolio_manager
+                .long
+                .iter()
+                .zip(&self.intraday.portfolio_manager.long_weights)
+                .map(|(strategy, &weight)| {
+                    (weight / phi)
+                        * RefCell::borrow(strategy)
+                            .optimal_equity_fraction(&self.intraday.price_tracker, symbol)
+                })
+                .sum::<Decimal>();
 
             if fraction < config.trading.minimum_position_equity_fraction {
                 equities.push(Decimal::ZERO);
                 continue;
             }
 
-            let total_equity = self.intraday.last_account.equity;
-            let usable_equity = Decimal::new(95, 2) * total_equity;
             equities.push(fraction * usable_equity);
         }
 
@@ -99,7 +167,7 @@ impl Engine {
     pub fn portfolio_manager_available_cash(&self) -> Decimal {
         Decimal::max(
             self.intraday.last_account.cash
-                - Decimal::new(5, 2) * self.intraday.last_account.equity,
+                - Config::get().trading.minimum_cash_fraction * self.intraday.last_account.equity,
             Decimal::ZERO,
         )
     }
@@ -107,85 +175,104 @@ impl Engine {
     pub fn portfolio_manager_minimum_trade(&self) -> Decimal {
         Decimal::max(
             self.intraday.last_account.equity * Config::get().trading.minimum_trade_equity_fraction,
-            Decimal::ONE,
+            Decimal::new(101, 2),
         )
     }
 
     pub async fn portfolio_manager_on_pre_open(&mut self) -> anyhow::Result<()> {
-        debug!("Running portfolio manager pre-open task");
+        info!("Running portfolio manager pre-open tasks");
 
-        let mut metadata = self
+        info!("Fetching recent market history");
+        let hist = self
             .local_history
-            .get_metadata()
-            .await
-            .context("Failed to fetch metadata")?;
-
-        let config = Config::get();
-        let minimum_median_volume = config.trading.minimum_median_volume;
-
-        metadata.retain(|_, meta| meta.median_volume as u64 >= minimum_median_volume);
-
-        debug!("Fetching equities list");
-        let equities = self.rest.us_equities().await?;
-
-        equities
+            .get_market_history(Timeframe::DaysBeforeNow(3))
+            .await?;
+        let pm = &mut self.intraday.portfolio_manager;
+        let key_to_index = pm
+            .long
             .iter()
-            .filter(|equity| {
-                !(equity.tradable && equity.fractionable) || equity.status != AssetStatus::Active
-            })
-            .flat_map(|equity| equity.symbol.to_compact())
-            .for_each(|symbol| {
-                metadata.remove(&symbol);
-            });
+            .enumerate()
+            .map(|(index, strategy)| (RefCell::borrow(&**strategy).key(), index))
+            .collect::<HashMap<_, _>>();
 
-        let mut by_performance = metadata
-            .into_iter()
-            .map(|(symbol, meta)| (symbol, PortfolioSymbolMeta::from(meta)))
-            .collect::<Vec<_>>();
-        by_performance.sort_unstable_by_key(|&(_, w)| Reverse(TotalF64(w.weight)));
+        info!("Updating strategy weights");
+        let mut returns = vec![Decimal::ZERO; pm.long.len()];
+        for (symbol, split) in &pm.initial_long_fractions {
+            let bars = hist.get(symbol).map(|bars| &**bars).unwrap_or(&[]);
+            let r = if bars.len() >= 2 {
+                let n = bars.len();
+                bars[n - 1].close / bars[n - 2].close
+            } else {
+                warn!("Insufficient history for symbol {symbol}, assuming return of 1");
+                Decimal::ONE
+            };
+
+            debug!("Return of {symbol}: {r}");
+
+            for (index, fraction) in split.iter().copied().enumerate() {
+                returns[index] += fraction * r;
+            }
+        }
+
+        // Print out the individual returns for each strategy
+        let mut combined_return = Decimal::ZERO;
+        let phi = pm.long_weights.iter().sum::<Decimal>();
+        for (key, index) in key_to_index {
+            let r = returns[index];
+            debug!("Return of {key}: {}", r);
+            combined_return += r * (pm.long_weights[index] / phi);
+        }
+        debug!("Combined expected portfolio return: {combined_return}");
+
+        if !pm.initial_long_fractions.is_empty() {
+            pm.long_weights.iter_mut().zip(returns).for_each(|(w, r)| {
+                *w *= mwu_multiplier(Delta::Return(r), ETA);
+            });
+        }
+
+        let long = pm.long.clone();
+        let num_long = long.len();
+        let mut initial_long_fractions = HashMap::new();
+        for (index, strategy) in long.into_iter().enumerate() {
+            let mut strategy = RefCell::borrow_mut(&*strategy);
+            strategy.on_pre_open(self).await?;
+            for symbol in strategy.candidates() {
+                let fraction =
+                    strategy.optimal_equity_fraction(&self.intraday.price_tracker, symbol);
+                initial_long_fractions
+                    .entry(symbol)
+                    .or_insert_with(|| vec![Decimal::ZERO; num_long])[index] = fraction;
+            }
+        }
+
+        debug!(
+            "Long fractions sum: {}",
+            initial_long_fractions.values().flatten().sum::<Decimal>()
+        );
 
         let pm = &mut self.intraday.portfolio_manager;
-        pm.candidates = by_performance
-            .into_iter()
-            .take(config.trading.max_position_count)
-            .collect();
+        pm.initial_long_fractions = initial_long_fractions;
 
-        // TODO: remove debug information
+        // TODO: remove debug stuff
         pm.starting_cash = self.intraday.last_account.cash;
 
         Ok(())
     }
 
     pub fn portfolio_manager_on_close(&self) {
-        let mut weight_dict = String::from("{");
-        for (symbol, meta) in &self.intraday.portfolio_manager.candidates {
-            weight_dict.push_str(&format!("'{symbol}':{},", meta.weight));
-        }
-        if weight_dict.len() > 1 {
-            weight_dict.pop();
-        }
-        weight_dict.push('}');
-        debug!("Weight dict: {weight_dict}");
-
-        let acc = &self.intraday.last_account;
-        let actual_return = (acc.equity - acc.cash)
-            / (acc.last_equity - self.intraday.portfolio_manager.starting_cash);
-
-        debug!("Actual Return: {actual_return}");
+        let current_invested_equity =
+            self.intraday.last_account.equity - self.intraday.last_account.cash;
+        let last_invested_equity =
+            self.intraday.last_account.last_equity - self.intraday.portfolio_manager.starting_cash;
+        debug!(
+            "Combined actual portfolio return: {}",
+            current_invested_equity / last_invested_equity
+        );
     }
 }
 
-#[derive(Clone, Copy, Serialize)]
-struct PortfolioSymbolMeta {
-    weight: f64,
-    last_close: f64,
-}
-
-impl From<SymbolMetadata> for PortfolioSymbolMeta {
-    fn from(meta: SymbolMetadata) -> Self {
-        Self {
-            weight: meta.performance,
-            last_close: meta.last_close,
-        }
-    }
+#[derive(Serialize, Deserialize, Default)]
+pub struct PortfolioManagerMetadata {
+    long_weights: HashMap<String, Decimal>,
+    initial_long_fractions: HashMap<Symbol, HashMap<String, Decimal>>,
 }

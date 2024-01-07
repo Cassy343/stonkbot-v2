@@ -24,9 +24,9 @@ impl PriceTracker {
     }
 
     pub fn price_info(&self, symbol: Symbol) -> Option<PriceInfo> {
-        self.stocks
-            .get(&symbol)
-            .and_then(|stock| stock.compute_price_info(OffsetDateTime::now_utc().time()))
+        self.stocks.get(&symbol).and_then(|stock| {
+            stock.compute_price_info(Config::localize(OffsetDateTime::now_utc()).time())
+        })
     }
 
     pub fn record_price(&mut self, symbol: Symbol, avg_span: f64, bar: Bar) -> Option<PriceInfo> {

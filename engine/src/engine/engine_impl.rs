@@ -1,14 +1,15 @@
 use super::{
     entry::EntryStrategy,
     orders::OrderManager,
-    portfolio::PortfolioManager,
-    positions::PositionManager,
+    portfolio::{PortfolioManager, PortfolioManagerMetadata},
+    positions::{PositionManager, PositionManagerMetadata},
     trailing::{PriceInfo, PriceTracker},
 };
 use crate::event::{
     stream::{StreamRequest, StreamRequestSender},
     ClockEvent, Command, EngineEvent, EventReceiver, StreamEvent,
 };
+use anyhow::Context;
 use common::config::Config;
 use entity::{
     data::Bar,
@@ -18,16 +19,23 @@ use history::{self, LocalHistory, LocalHistoryImpl};
 use log::{debug, error, info, log, trace, warn, Level};
 use rest::AlpacaRestApi;
 use rust_decimal::Decimal;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
-    collections::{hash_map::Entry, HashMap},
+    collections::{HashMap, HashSet},
     fs,
     io::{self, Cursor, Write},
+    path::Path,
     sync::Arc,
 };
 use stock_symbol::Symbol;
 use time::{Duration, OffsetDateTime};
-use tokio::task;
+use tokio::{
+    fs::OpenOptions,
+    io::{AsyncReadExt, AsyncWriteExt},
+    task,
+};
+
+const METADATA_FILE: &str = "metadata.json";
 
 #[derive(Serialize)]
 pub struct Engine {
@@ -44,13 +52,13 @@ pub struct Engine {
 
 #[derive(Serialize)]
 pub struct IntradayTracker {
+    pub blacklist: HashSet<Symbol>,
     pub price_tracker: PriceTracker,
     pub order_manager: OrderManager,
     pub portfolio_manager: PortfolioManager,
     #[serde(skip)]
     pub stream: StreamRequestSender,
     pub entry_strategy: EntryStrategy,
-    pub span_cache: HashMap<Symbol, f64>,
     pub last_position_map: HashMap<Symbol, Position>,
     pub last_account: Account,
 }
@@ -63,7 +71,66 @@ pub struct ClockInfo {
     pub duration_until_close: Option<Duration>,
 }
 
+#[derive(Serialize, Deserialize, Default)]
+pub struct EngineMetadata {
+    pub position_metadata: PositionManagerMetadata,
+    pub portfolio_metadata: PortfolioManagerMetadata,
+}
+
+impl EngineMetadata {
+    pub async fn load() -> anyhow::Result<Self> {
+        let metadata_path = Path::new(METADATA_FILE);
+
+        let meta = if metadata_path.exists() {
+            let mut metadata_file = OpenOptions::new()
+                .read(true)
+                .write(false)
+                .open(metadata_path)
+                .await
+                .context("Failed to open metadata file")?;
+
+            let mut buf =
+                String::with_capacity(usize::try_from(metadata_file.metadata().await?.len())?);
+            metadata_file
+                .read_to_string(&mut buf)
+                .await
+                .context("Failed to read metadata file")?;
+
+            serde_json::from_str(&buf)
+                .with_context(|| format!("Failed to parse {METADATA_FILE}"))?
+        } else {
+            Self::default()
+        };
+
+        Ok(meta)
+    }
+
+    pub async fn save(&self) -> anyhow::Result<()> {
+        let mut metadata_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(Path::new(METADATA_FILE))
+            .await
+            .context("Failed to open metadata file")?;
+
+        let buf = serde_json::to_string(self).context("Failed to serialize engine metadata")?;
+        metadata_file.write_all(buf.as_bytes()).await?;
+
+        Ok(())
+    }
+}
+
 pub async fn run(events: EventReceiver, rest: AlpacaRestApi, stream: StreamRequestSender) {
+    let metadata = match EngineMetadata::load().await {
+        Ok(meta) => meta,
+        Err(error) => {
+            error!("Failed to read metadata file: {error:?}");
+            return;
+        }
+    };
+
     let local_history = match history::init_local_history().await {
         Ok(hist) => Arc::new(hist),
         Err(error) => {
@@ -73,13 +140,7 @@ pub async fn run(events: EventReceiver, rest: AlpacaRestApi, stream: StreamReque
     };
 
     let order_manager = OrderManager::new(rest.clone());
-    let position_manager = match PositionManager::new().await {
-        Ok(pm) => pm,
-        Err(error) => {
-            error!("Failed to initialize position manager: {error:?}");
-            return;
-        }
-    };
+    let position_manager = PositionManager::new(metadata.position_metadata);
 
     let (last_position_map, last_account) = match (rest.position_map().await, rest.account().await)
     {
@@ -90,16 +151,24 @@ pub async fn run(events: EventReceiver, rest: AlpacaRestApi, stream: StreamReque
         }
     };
 
+    let portfolio_manager = match PortfolioManager::new(metadata.portfolio_metadata) {
+        Ok(pm) => pm,
+        Err(error) => {
+            error!("Failed to initialize portfolio manager: {error}");
+            return;
+        }
+    };
+
     let mut engine = Engine {
         rest,
         local_history,
         intraday: IntradayTracker {
+            blacklist: HashSet::new(),
             price_tracker: PriceTracker::new(),
             order_manager,
-            portfolio_manager: PortfolioManager::new(),
+            portfolio_manager,
             stream,
             entry_strategy: EntryStrategy::new(),
-            span_cache: HashMap::new(),
             last_position_map,
             last_account,
         },
@@ -111,12 +180,20 @@ pub async fn run(events: EventReceiver, rest: AlpacaRestApi, stream: StreamReque
 
     engine.run(events).await;
 
-    if let Err(error) = engine.position_manager.save_metadata().await {
-        error!("Failed to save position metadata: {error:?}");
+    let metadata = engine.into_metadata();
+    if let Err(error) = metadata.save().await {
+        error!("Failed to save engine metadata: {error}");
     }
 }
 
 impl Engine {
+    fn into_metadata(self) -> EngineMetadata {
+        EngineMetadata {
+            position_metadata: self.position_manager.into_metadata(),
+            portfolio_metadata: self.intraday.portfolio_manager.into_metadata(),
+        }
+    }
+
     async fn run(&mut self, mut events: EventReceiver) {
         loop {
             let event = events.next().await;
@@ -225,12 +302,23 @@ impl Engine {
             }
         }
 
-        self.intraday.span_cache.clear();
-
         self.update_account_info().await?;
+
+        // Construct the blacklist
+        let equities = self.rest.us_equities().await?;
+        self.intraday.blacklist = equities
+            .into_iter()
+            .filter(|equity| {
+                !(equity.tradable && equity.fractionable && equity.status == AssetStatus::Active)
+            })
+            .flat_map(|equity| equity.symbol.to_compact())
+            .chain(Config::get().trading.blacklist.iter().cloned())
+            .collect();
 
         self.portfolio_manager_on_pre_open().await?;
         self.position_manager_on_pre_open().await?;
+
+        info!("Finished running pre-open tasks");
 
         Ok(())
     }
@@ -273,27 +361,24 @@ impl Engine {
         }
 
         self.intraday.price_tracker.clear();
-
-        // TODO: remove debug output here
-        let _ = self.update_account_info();
         self.portfolio_manager_on_close();
     }
 
     pub async fn get_avg_span(&mut self, symbol: Symbol) -> f64 {
-        match self.intraday.span_cache.entry(symbol) {
-            Entry::Occupied(entry) => *entry.get(),
-            Entry::Vacant(entry) => {
-                let span = match self.local_history.get_symbol_avg_span(symbol).await {
-                    Ok(span) => span,
-                    Err(error) => {
-                        warn!("Failed to fetch span for {symbol}: {error:?}");
-                        0.02
-                    }
-                };
-                entry.insert(span);
-                span
+        match self.local_history.get_symbol_avg_span(symbol).await {
+            Ok(span) => span,
+            Err(error) => {
+                warn!("Failed to fetch span for {symbol}: {error:?}");
+                0.02
             }
         }
+    }
+
+    pub fn within_duration_of_close(&self, duration: Duration) -> bool {
+        self.clock_info
+            .duration_until_close
+            .map(|until_close| until_close < duration)
+            .unwrap_or(false)
     }
 
     async fn handle_command(&mut self, command: Command) {
@@ -389,6 +474,7 @@ impl Engine {
                     }
                 };
 
+                let config_blacklist = &Config::get().trading.blacklist;
                 let untracked_equities = equities
                     .into_iter()
                     .flat_map(|asset| asset.symbol.to_compact().map(|symbol| (symbol, asset)))
@@ -397,6 +483,7 @@ impl Engine {
                             && asset.fractionable
                             && asset.status == AssetStatus::Active
                             && !local_symbols.contains(symbol)
+                            && !config_blacklist.contains(symbol)
                     })
                     .map(|(symbol, _)| symbol)
                     .collect::<Vec<_>>();
