@@ -26,7 +26,7 @@ pub struct PortfolioManager {
     long: Vec<Rc<RefCell<dyn LongPortfolioStrategy>>>,
     long_weights: Vec<Decimal>,
     initial_long_fractions: HashMap<Symbol, Vec<Decimal>>,
-    starting_cash: Decimal,
+    last_equity_at_close: Decimal,
 }
 
 impl PortfolioManager {
@@ -69,7 +69,7 @@ impl PortfolioManager {
             long,
             long_weights,
             initial_long_fractions,
-            starting_cash: Decimal::ZERO,
+            last_equity_at_close: meta.last_equity_at_close,
         })
     }
 
@@ -123,6 +123,7 @@ impl PortfolioManager {
                 .into_iter()
                 .map(|(symbol, split)| (symbol, keys.clone().into_iter().zip(split).collect()))
                 .collect(),
+            last_equity_at_close: self.last_equity_at_close,
         }
     }
 }
@@ -222,7 +223,9 @@ impl Engine {
             debug!("Return of {key}: {}", r);
             combined_return += r * (pm.long_weights[index] / phi);
         }
-        debug!("Combined expected portfolio return: {combined_return}");
+        let cash_fraction = Config::get().trading.minimum_cash_fraction;
+        let expected_return = combined_return + cash_fraction - combined_return * cash_fraction;
+        debug!("Combined expected portfolio return: {expected_return}");
 
         if !pm.initial_long_fractions.is_empty() {
             pm.long_weights.iter_mut().zip(returns).for_each(|(w, r)| {
@@ -253,21 +256,21 @@ impl Engine {
         let pm = &mut self.intraday.portfolio_manager;
         pm.initial_long_fractions = initial_long_fractions;
 
-        // TODO: remove debug stuff
-        pm.starting_cash = self.intraday.last_account.cash;
-
         Ok(())
     }
 
-    pub fn portfolio_manager_on_close(&self) {
-        let current_invested_equity =
-            self.intraday.last_account.equity - self.intraday.last_account.cash;
-        let last_invested_equity =
-            self.intraday.last_account.last_equity - self.intraday.portfolio_manager.starting_cash;
-        debug!(
-            "Combined actual portfolio return: {}",
-            current_invested_equity / last_invested_equity
-        );
+    pub fn portfolio_manager_on_close(&mut self) {
+        let current_equity = self.intraday.last_account.equity;
+        let last_equity = self.intraday.portfolio_manager.last_equity_at_close;
+
+        if last_equity > Decimal::ZERO {
+            debug!(
+                "Combined actual portfolio return: {}",
+                current_equity / last_equity
+            );
+        }
+
+        self.intraday.portfolio_manager.last_equity_at_close = current_equity;
     }
 }
 
@@ -275,4 +278,5 @@ impl Engine {
 pub struct PortfolioManagerMetadata {
     long_weights: HashMap<String, Decimal>,
     initial_long_fractions: HashMap<Symbol, HashMap<String, Decimal>>,
+    last_equity_at_close: Decimal,
 }

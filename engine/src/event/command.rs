@@ -85,6 +85,7 @@ fn parse_command(input: &str) -> Option<Command> {
     let args = components.collect::<Vec<_>>();
 
     match command {
+        "buytoggle" => buytoggle(&args),
         "cts" => Some(Command::CurrentTrackedSymbols),
         "engdump" | "engine-dump" => Some(Command::EngineDump),
         "pi" | "price-info" => price_info(&args),
@@ -100,6 +101,24 @@ fn parse_command(input: &str) -> Option<Command> {
             None
         }
     }
+}
+
+fn buytoggle(args: &[&str]) -> Option<Command> {
+    if args.len() != 1 {
+        println!("Expected one argument: on/off");
+        return None;
+    }
+
+    let allow = match args[0] {
+        "on" => true,
+        "off" => false,
+        _ => {
+            println!("Expected argument to be on/off");
+            return None;
+        }
+    };
+
+    Some(Command::BuyToggle { allow })
 }
 
 fn price_info(args: &[&str]) -> Option<Command> {

@@ -45,7 +45,6 @@ pub struct Engine {
     pub local_history: Arc<LocalHistoryImpl>,
     pub intraday: IntradayTracker,
     pub position_manager: PositionManager,
-    pub should_buy: bool,
     pub in_safety_mode: bool,
     pub clock_info: ClockInfo,
 }
@@ -173,7 +172,6 @@ pub async fn run(events: EventReceiver, rest: AlpacaRestApi, stream: StreamReque
             last_account,
         },
         position_manager,
-        should_buy: true,
         in_safety_mode: false,
         clock_info: ClockInfo::default(),
     };
@@ -383,6 +381,23 @@ impl Engine {
 
     async fn handle_command(&mut self, command: Command) {
         match command {
+            Command::BuyToggle { allow } => {
+                if allow == self.intraday.order_manager.allow_buying {
+                    if allow {
+                        info!("Buying already enabled");
+                    } else {
+                        info!("Buying already disabled");
+                    }
+                } else {
+                    self.intraday.order_manager.allow_buying = allow;
+
+                    if allow {
+                        info!("Buying enabled");
+                    } else {
+                        info!("Buying disabled");
+                    }
+                }
+            }
             Command::CurrentTrackedSymbols => {
                 let mut iter = self.intraday.price_tracker.tracked_symbols();
                 let mut cts_string = match iter.next() {

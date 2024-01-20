@@ -87,6 +87,7 @@ impl From<StreamEvent> for EngineEvent {
 
 #[derive(Debug)]
 pub enum Command {
+    BuyToggle { allow: bool },
     CurrentTrackedSymbols,
     EngineDump,
     PriceInfo { symbol: Symbol },

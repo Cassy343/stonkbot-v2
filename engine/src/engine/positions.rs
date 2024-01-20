@@ -178,7 +178,7 @@ impl Engine {
     }
 
     pub async fn position_buy_trigger(&mut self, symbol: Symbol) -> anyhow::Result<()> {
-        if !self.within_duration_of_close(Duration::minutes(195)) {
+        if !self.within_duration_of_close(Duration::seconds(30)) {
             return Ok(());
         }
 

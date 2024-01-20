@@ -17,6 +17,7 @@ pub struct OrderManager {
     rest: AlpacaRestApi,
     trade_statuses: HashMap<Symbol, TradeStatus>,
     open_orders: Vec<OrderMeta>,
+    pub allow_buying: bool,
 }
 
 impl OrderManager {
@@ -25,6 +26,7 @@ impl OrderManager {
             rest,
             trade_statuses: HashMap::new(),
             open_orders: Vec::new(),
+            allow_buying: true,
         }
     }
 
@@ -112,6 +114,11 @@ impl OrderManager {
     }
 
     pub async fn buy(&mut self, symbol: Symbol, notional: Decimal) -> anyhow::Result<()> {
+        if !self.allow_buying {
+            info!("Buying disabled, ignoring order for {symbol}");
+            return Ok(());
+        }
+
         let order = self
             .rest
             .submit_order(&OrderRequest {
