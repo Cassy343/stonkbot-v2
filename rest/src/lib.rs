@@ -11,6 +11,7 @@ use rust_decimal::Decimal;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde::Deserializer;
+use serde::Serialize;
 use std::time::Duration as StdDuration;
 use stock_symbol::Symbol;
 use time::format_description::well_known::Rfc3339;
@@ -139,6 +140,29 @@ impl AlpacaRestApi {
             .await
     }
 
+    pub async fn get_orders(
+        &self,
+        status: RequestOrderStatus,
+        limit: usize,
+        after: OffsetDateTime,
+    ) -> anyhow::Result<Vec<Order>> {
+        Self::send(self.trading_endpoint(Method::GET, "/orders").query(&(
+            ("status", status),
+            ("limit", limit),
+            ("after", after.format(&Rfc3339)?),
+            ("direction", "asc"),
+        )))
+        .await
+    }
+
+    pub async fn dividends(&self) -> anyhow::Result<Vec<DividendActivity>> {
+        Self::send(
+            self.trading_endpoint(Method::GET, "/account/activities")
+                .query(&[("activity_types", "DIV")]),
+        )
+        .await
+    }
+
     pub async fn day_bar<B: DeserializeOwned>(
         &self,
         stock: Symbol,
@@ -237,6 +261,14 @@ impl AlpacaRestApi {
 
         Ok(agg_history)
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestOrderStatus {
+    Open,
+    Closed,
+    All,
 }
 
 #[derive(Deserialize)]

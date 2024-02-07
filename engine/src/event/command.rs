@@ -2,6 +2,7 @@ use std::array;
 use std::{num::NonZeroUsize, time::Duration};
 
 use crate::event::{Command, EventEmitter};
+use crate::{PortfolioStrategySubcommand, TaxSubcommand};
 use common::config::Config;
 use log::error;
 use rustyline::error::ReadlineError;
@@ -88,12 +89,15 @@ fn parse_command(input: &str) -> Option<Command> {
         "buytoggle" => buytoggle(&args),
         "cts" => Some(Command::CurrentTrackedSymbols),
         "engdump" | "engine-dump" => Some(Command::EngineDump),
+        "liquidate" => Some(Command::Liquidate),
         "pi" | "price-info" => price_info(&args),
+        "ps" => portfolio_strategy(&args),
         "rpo" | "run-pre-open" => Some(Command::RunPreOpen),
         "rr" | "repair-records" => repair_records(&args),
         "status" => Some(Command::Status),
-        "stop" => Some(Command::Stop),
+        "stop" | "quit" | "exit" | "q" => Some(Command::Stop),
         "suo" | "set-utc-offset" => set_utc_offset(&args),
+        "tax" => tax(&args),
         "uhist" => update_history(&args),
         "untracked-symbols" | "usym" => Some(Command::UntrackedSymbols),
         _ => {
@@ -139,6 +143,43 @@ fn price_info(args: &[&str]) -> Option<Command> {
     };
 
     Some(Command::PriceInfo { symbol })
+}
+
+fn portfolio_strategy(args: &[&str]) -> Option<Command> {
+    let first = match args.first().copied() {
+        Some("list") => {
+            return Some(Command::PortfolioStrategy(
+                PortfolioStrategySubcommand::List,
+            ))
+        }
+        Some(first) => first,
+        None => {
+            println!(
+                "Expected one of the following sub-commands: list, enable, disable, liquidate"
+            );
+            return None;
+        }
+    };
+
+    let key = match args.get(1).copied() {
+        Some(key) => key.to_owned(),
+        None => {
+            println!("Expected strategy key");
+            return None;
+        }
+    };
+
+    let subcommand = match first {
+        "enable" => PortfolioStrategySubcommand::Enable { key },
+        "disable" => PortfolioStrategySubcommand::Disable { key },
+        "liquidate" => PortfolioStrategySubcommand::Liquidate { key },
+        _ => {
+            println!("Unknown subcommand \"{first}\"");
+            return None;
+        }
+    };
+
+    Some(Command::PortfolioStrategy(subcommand))
 }
 
 fn repair_records(args: &[&str]) -> Option<Command> {
@@ -201,6 +242,35 @@ fn set_utc_offset(args: &[&str]) -> Option<Command> {
     Config::get().utc_offset.set(offset);
     println!("Updated UTC offset");
     None
+}
+
+fn tax(args: &[&str]) -> Option<Command> {
+    match args.first().copied() {
+        Some("update") => return Some(Command::Tax(TaxSubcommand::Update)),
+        Some("evaluate" | "eval") => (),
+        Some(subcommand) => {
+            println!("Unknown sub-command \"{subcommand}\", expected \"update\" or \"evaluate\"");
+            return None;
+        }
+        None => {
+            println!("Expected sub-command \"update\" or \"evaluate\"");
+            return None;
+        }
+    }
+
+    match args.get(1).map(|&year| year.parse::<i32>()) {
+        Some(Ok(year)) => Some(Command::Tax(TaxSubcommand::Evaluate {
+            calendar_year: year,
+        })),
+        Some(Err(error)) => {
+            println!("Failed to parse calendar year: {error}");
+            None
+        }
+        None => {
+            println!("Usage: tax evaluate <calendar_year>");
+            None
+        }
+    }
 }
 
 fn update_history(args: &[&str]) -> Option<Command> {

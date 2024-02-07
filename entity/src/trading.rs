@@ -1,11 +1,12 @@
 use std::fmt::{self, Debug, Display, Formatter};
 
+use common::util::deserialize_date_from_str;
 use rust_decimal::Decimal;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use stock_symbol::Symbol;
 use time::serde::rfc3339;
-use time::OffsetDateTime;
+use time::{Date, OffsetDateTime};
 use uuid::Uuid;
 
 #[derive(Serialize, Deserialize)]
@@ -131,6 +132,14 @@ pub struct Order {
     pub symbol: Symbol,
     pub status: OrderStatus,
     pub side: OrderSide,
+    #[serde(with = "rfc3339")]
+    pub submitted_at: OffsetDateTime,
+    #[serde(default, with = "rfc3339::option")]
+    pub filled_at: Option<OffsetDateTime>,
+    #[serde(default)]
+    pub filled_qty: Option<Decimal>,
+    #[serde(default)]
+    pub filled_avg_price: Option<Decimal>,
     // We don't need the other fields
 }
 
@@ -163,7 +172,7 @@ impl OrderStatus {
     }
 }
 
-#[derive(PartialEq, Eq, Serialize, Deserialize)]
+#[derive(PartialEq, Eq, Serialize, Deserialize, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
 pub enum OrderSide {
     Buy,
@@ -248,6 +257,14 @@ pub enum OrderClass {
     OneCancelsOther,
     #[serde(rename = "oto")]
     OneTriggersOther,
+}
+
+#[derive(Deserialize)]
+pub struct DividendActivity {
+    #[serde(deserialize_with = "deserialize_date_from_str")]
+    pub date: Date,
+    pub symbol: Symbol,
+    pub net_amount: Decimal,
 }
 
 #[derive(Debug, Clone)]

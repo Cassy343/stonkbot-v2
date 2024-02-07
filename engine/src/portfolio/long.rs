@@ -1,4 +1,4 @@
-use std::{cell::RefCell, cmp::Reverse, collections::HashMap, rc::Rc};
+use std::{cmp::Reverse, collections::HashMap};
 
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
@@ -6,7 +6,7 @@ use common::{
     config::Config,
     mwu::{mwu_multiplier, Delta},
 };
-use entity::data::SymbolMetadata;
+use entity::data::{Bar, SymbolMetadata};
 use history::{LocalHistory, Timeframe};
 use log::info;
 use rust_decimal::Decimal;
@@ -18,11 +18,11 @@ use crate::engine::{Engine, PriceInfo, PriceTracker};
 
 use super::LongPortfolioStrategy;
 
-pub fn make_long_portfolio() -> anyhow::Result<Vec<Rc<RefCell<dyn LongPortfolioStrategy>>>> {
+pub fn make_long_portfolio() -> anyhow::Result<Vec<Box<dyn LongPortfolioStrategy>>> {
     Ok(vec![
-        Rc::new(RefCell::new(MWUDow30::new()?)),
-        Rc::new(RefCell::new(MWUMarketTop5::new())),
-        Rc::new(RefCell::new(WMWUMarketTop5::new()?)),
+        Box::new(MWUDow30::new()?),
+        Box::new(MWUMarketTop5::new()),
+        Box::new(WMWUMarketTop5::new()?),
     ])
 }
 
@@ -32,6 +32,11 @@ fn weights_to_fraction(symbol: Symbol, weights: &HashMap<Symbol, Decimal>) -> De
         .get(&symbol)
         .map(|w| w / phi)
         .unwrap_or(Decimal::ZERO)
+}
+
+fn weights_to_fractions(weights: &mut HashMap<Symbol, Decimal>) {
+    let phi = weights.values().sum::<Decimal>();
+    weights.values_mut().for_each(|w| *w /= phi);
 }
 
 #[derive(Clone, Serialize)]
@@ -77,6 +82,24 @@ impl MWU {
         let weights = self.latest_weights(price_tracker);
         weights_to_fraction(symbol, &weights)
     }
+
+    fn intraday_return(&self, price_tracker: &PriceTracker) -> Decimal {
+        let mut weights = self.latest_weights(price_tracker);
+        weights_to_fractions(&mut weights);
+        let fractions = weights;
+        let mut r = Decimal::ZERO;
+        for (&symbol, &meta) in &self.candidates {
+            let f = fractions[&symbol];
+
+            let symbol_return = match price_tracker.price_info(symbol) {
+                Some(PriceInfo { latest_price, .. }) => latest_price / meta.last_close,
+                None => Decimal::ONE,
+            };
+
+            r += f * symbol_return;
+        }
+        r
+    }
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -98,15 +121,13 @@ impl From<SymbolMetadata> for MWUMeta {
 struct WMWU {
     candidates: HashMap<Symbol, WMWUMeta>,
     eta: Decimal,
-    lookback: usize,
 }
 
 impl WMWU {
-    fn new(eta: Decimal, lookback: usize) -> Self {
+    fn new(eta: Decimal) -> Self {
         Self {
             candidates: HashMap::new(),
             eta,
-            lookback,
         }
     }
 
@@ -140,6 +161,24 @@ impl WMWU {
         let weights = self.latest_weights(price_tracker);
         weights_to_fraction(symbol, &weights)
     }
+
+    fn intraday_return(&self, price_tracker: &PriceTracker) -> Decimal {
+        let mut weights = self.latest_weights(price_tracker);
+        weights_to_fractions(&mut weights);
+        let fractions = weights;
+        let mut r = Decimal::ZERO;
+        for (&symbol, &meta) in &self.candidates {
+            let f = fractions[&symbol];
+
+            let symbol_return = match price_tracker.price_info(symbol) {
+                Some(PriceInfo { latest_price, .. }) => latest_price / meta.last_close,
+                None => Decimal::ONE,
+            };
+
+            r += f * symbol_return;
+        }
+        r
+    }
 }
 
 #[derive(Clone, Copy, Serialize)]
@@ -147,6 +186,32 @@ struct WMWUMeta {
     weight: Decimal,
     next_weight_base: Decimal,
     last_close: Decimal,
+}
+
+impl WMWUMeta {
+    fn new(symbol_meta: &SymbolMetadata, bars: &[Bar], eta: Decimal, lookback: usize) -> Self {
+        let mut weight = Decimal::ONE;
+        let mut next_weight_base = Decimal::ONE;
+
+        for window in bars.windows(2).rev().take(lookback) {
+            let multiplier = mwu_multiplier(Delta::Return(window[1].close / window[0].close), eta);
+            next_weight_base = weight;
+            weight *= multiplier;
+        }
+
+        // Since we take windows of 2 bars at a time, we need lookback+1 bars to get a complete
+        // history. If we have less than that, then our weight base should equal our current
+        // weight, since no bars are old enough to "forget"
+        if bars.len() <= lookback {
+            next_weight_base = weight;
+        }
+
+        Self {
+            weight,
+            next_weight_base,
+            last_close: symbol_meta.last_close,
+        }
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -191,6 +256,10 @@ impl LongPortfolioStrategy for MWUDow30 {
 
     fn optimal_equity_fraction(&self, price_tracker: &PriceTracker, symbol: Symbol) -> Decimal {
         self.mwu.optimal_equity_fraction(price_tracker, symbol)
+    }
+
+    fn intraday_return(&self, price_tracker: &PriceTracker) -> Decimal {
+        self.mwu.intraday_return(price_tracker)
     }
 
     async fn on_pre_open(&mut self, engine: &Engine) -> anyhow::Result<()> {
@@ -255,6 +324,10 @@ impl LongPortfolioStrategy for MWUMarketTop5 {
         self.mwu.optimal_equity_fraction(price_tracker, symbol)
     }
 
+    fn intraday_return(&self, price_tracker: &PriceTracker) -> Decimal {
+        self.mwu.intraday_return(price_tracker)
+    }
+
     async fn on_pre_open(&mut self, engine: &Engine) -> anyhow::Result<()> {
         info!("Initializing MWU market top 5 strategy");
 
@@ -282,6 +355,7 @@ impl LongPortfolioStrategy for MWUMarketTop5 {
 #[derive(Clone, Serialize)]
 struct WMWUMarketTop5 {
     wmwu: WMWU,
+    lookback: usize,
 }
 
 impl WMWUMarketTop5 {
@@ -292,7 +366,8 @@ impl WMWUMarketTop5 {
         };
 
         Ok(Self {
-            wmwu: WMWU::new(config.eta, config.lookback),
+            wmwu: WMWU::new(config.eta),
+            lookback: config.lookback,
         })
     }
 }
@@ -315,6 +390,10 @@ impl LongPortfolioStrategy for WMWUMarketTop5 {
         self.wmwu.optimal_equity_fraction(price_tracker, symbol)
     }
 
+    fn intraday_return(&self, price_tracker: &PriceTracker) -> Decimal {
+        self.wmwu.intraday_return(price_tracker)
+    }
+
     async fn on_pre_open(&mut self, engine: &Engine) -> anyhow::Result<()> {
         info!("Initializing WMWU market top 5 strategy");
 
@@ -333,7 +412,7 @@ impl LongPortfolioStrategy for WMWUMarketTop5 {
 
         let history = engine
             .local_history
-            .get_market_history(Timeframe::DaysBeforeNow(self.wmwu.lookback + 3))
+            .get_market_history(Timeframe::DaysBeforeNow(self.lookback + 3))
             .await
             .context("Failed to fetch market history")?;
 
@@ -344,29 +423,9 @@ impl LongPortfolioStrategy for WMWUMarketTop5 {
                 None => return Err(anyhow!("No local history for {symbol}")),
             };
 
-            let mut weight = Decimal::ONE;
-            let mut next_weight_base = Decimal::ONE;
-
-            for window in bars.windows(2).rev().take(self.wmwu.lookback) {
-                let multiplier = mwu_multiplier(
-                    Delta::Return(window[1].close / window[0].close),
-                    self.wmwu.eta,
-                );
-                next_weight_base = weight;
-                weight *= multiplier;
-            }
-
-            if bars.len() <= self.wmwu.lookback {
-                next_weight_base = weight;
-            }
-
             candidates.push((
                 symbol,
-                WMWUMeta {
-                    weight,
-                    next_weight_base,
-                    last_close: meta.last_close,
-                },
+                WMWUMeta::new(&meta, bars, self.wmwu.eta, self.lookback),
             ));
         }
 

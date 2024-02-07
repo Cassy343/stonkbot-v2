@@ -1,8 +1,6 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::rc::Rc;
+use std::collections::{BTreeMap, HashMap};
+use std::{cell::RefCell, mem};
 
-use anyhow::anyhow;
 use common::{
     config::Config,
     mwu::{mwu_multiplier, Delta},
@@ -17,149 +15,144 @@ use stock_symbol::Symbol;
 use crate::portfolio::{make_long_portfolio, LongPortfolioStrategy};
 
 use super::engine_impl::Engine;
+use super::PriceTracker;
 
-const ETA: f64 = 0.5;
+const ETA: f64 = 0.8;
 
 #[derive(Serialize)]
 pub struct PortfolioManager {
-    #[serde(serialize_with = "PortfolioManager::serialize_long")]
-    long: Vec<Rc<RefCell<dyn LongPortfolioStrategy>>>,
-    long_weights: Vec<Decimal>,
-    initial_long_fractions: HashMap<Symbol, Vec<Decimal>>,
-    last_equity_at_close: Decimal,
+    long: HashMap<&'static str, Strategy>,
+    initial_long_fractions: HashMap<Symbol, HashMap<&'static str, Decimal>>,
+    last_equity_at_close: Equity,
+    // Day before last
+    dbl_equity_at_close: Equity,
 }
 
 impl PortfolioManager {
     pub fn new(meta: PortfolioManagerMetadata) -> anyhow::Result<Self> {
-        let long = make_long_portfolio()?;
-        let key_to_index = long
-            .iter()
-            .enumerate()
-            .map(|(index, strategy)| (RefCell::borrow(&**strategy).key(), index))
+        let long = make_long_portfolio()?
+            .into_iter()
+            .map(|inner| {
+                let key = inner.key();
+                (
+                    key,
+                    Strategy::new(inner, meta.long.get(key).cloned().unwrap_or_default()),
+                )
+            })
             .collect::<HashMap<_, _>>();
-        let long_weights = long
-            .iter()
-            .map(|strategy| {
-                meta.long_weights
-                    .get(RefCell::borrow(strategy).key())
-                    .copied()
-                    .unwrap_or(Decimal::ONE)
+
+        let initial_long_fractions = meta
+            .initial_long_fractions
+            .into_iter()
+            .map(|(symbol, split)| {
+                (
+                    symbol,
+                    long.keys()
+                        .map(|&key| (key, split.get(key).copied().unwrap_or(Decimal::ZERO)))
+                        .collect(),
+                )
             })
             .collect();
-        let mut initial_long_fractions = HashMap::with_capacity(meta.initial_long_fractions.len());
-        for (symbol, split) in meta.initial_long_fractions {
-            let vec_split = initial_long_fractions
-                .entry(symbol)
-                .or_insert_with(|| vec![Decimal::ZERO; long.len()]);
-            for (key, fraction) in split {
-                match key_to_index.get(&*key) {
-                    Some(&index) => {
-                        vec_split[index] = fraction;
-                    }
-                    None => {
-                        return Err(anyhow!(
-                            "Found invalid key {key} when initializing position manager"
-                        ))
-                    }
-                }
-            }
-        }
 
         Ok(Self {
             long,
-            long_weights,
             initial_long_fractions,
             last_equity_at_close: meta.last_equity_at_close,
+            dbl_equity_at_close: meta.dbl_equity_at_close,
         })
-    }
-
-    fn serialize_long<S>(
-        long: &[Rc<RefCell<dyn LongPortfolioStrategy>>],
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let map = long
-            .iter()
-            .map(|strategy| {
-                let strategy = RefCell::borrow(strategy);
-                let key = strategy.key();
-                let value = match strategy.as_json_value() {
-                    Ok(value) => value,
-                    Err(error) => {
-                        error!("Failed to serialize data for portfolio strategy {key}: {error}");
-                        Value::Null
-                    }
-                };
-                (key, value)
-            })
-            .collect::<HashMap<_, _>>();
-        map.serialize(serializer)
     }
 
     pub fn candidates(&self) -> impl Iterator<Item = Symbol> + '_ {
         self.long
+            .values()
+            .flat_map(|strategy| strategy.effective_candidates())
+    }
+
+    pub fn strategies(&self) -> BTreeMap<&'static str, StrategyState> {
+        self.long
             .iter()
-            .flat_map(|strategy| RefCell::borrow(strategy).candidates())
+            .map(|(&key, strategy)| (key, strategy.get_state()))
+            .collect()
+    }
+
+    pub fn set_strategy_state(&mut self, key: &str, state: StrategyState) -> Option<StrategyState> {
+        self.long
+            .get_mut(key)
+            .map(|strategy| strategy.set_state(state))
     }
 
     pub fn into_metadata(self) -> PortfolioManagerMetadata {
-        let keys = self
-            .long
-            .iter()
-            .map(|strategy| RefCell::borrow(&**strategy).key().to_owned())
-            .collect::<Vec<_>>();
-
         PortfolioManagerMetadata {
-            long_weights: self
+            long: self
                 .long
-                .iter()
-                .map(|strategy| RefCell::borrow(&**strategy).key().to_owned())
-                .zip(self.long_weights)
+                .into_iter()
+                .map(|(key, strategy)| (key.to_owned(), strategy.into_metadata()))
                 .collect(),
             initial_long_fractions: self
                 .initial_long_fractions
                 .into_iter()
-                .map(|(symbol, split)| (symbol, keys.clone().into_iter().zip(split).collect()))
+                .map(|(symbol, split)| {
+                    (
+                        symbol,
+                        split
+                            .into_iter()
+                            .map(|(key, f)| (key.to_owned(), f))
+                            .collect(),
+                    )
+                })
                 .collect(),
             last_equity_at_close: self.last_equity_at_close,
+            dbl_equity_at_close: self.dbl_equity_at_close,
         }
     }
 }
 
 impl Engine {
+    fn equity(&self) -> Equity {
+        let cash = self.intraday.last_account.cash;
+        let long = self
+            .intraday
+            .last_position_map
+            .iter()
+            .map(|(&symbol, position)| (symbol, position.market_value))
+            .collect();
+        Equity { cash, long }
+    }
+
     pub fn portfolio_manager_optimal_equity(
         &mut self,
         symbols: &[Symbol],
     ) -> anyhow::Result<Vec<Decimal>> {
         let pm = &self.intraday.portfolio_manager;
-        let phi = pm.long_weights.iter().sum::<Decimal>();
+        let pt = &self.intraday.price_tracker;
+
+        let latest_weights = pm
+            .long
+            .iter()
+            .map(|(&key, strategy)| (key, strategy.latest_effective_weight(pt)))
+            .collect::<HashMap<_, _>>();
+        let phi = latest_weights.values().sum::<Decimal>();
+
         let config = Config::get();
         let total_equity = self.intraday.last_account.equity;
-        let usable_equity = (Decimal::ONE - config.trading.minimum_cash_fraction) * total_equity;
+        let usable_equity = (Decimal::ONE - config.trading.target_cash_fraction) * total_equity;
         let mut equities = Vec::with_capacity(symbols.len());
 
         for &symbol in symbols {
-            let fraction = self
-                .intraday
-                .portfolio_manager
+            let fraction = pm
                 .long
                 .iter()
-                .zip(&self.intraday.portfolio_manager.long_weights)
-                .map(|(strategy, &weight)| {
-                    (weight / phi)
-                        * RefCell::borrow(strategy)
-                            .optimal_equity_fraction(&self.intraday.price_tracker, symbol)
+                .map(|(key, strategy)| {
+                    (latest_weights[key] / phi)
+                        * strategy.optimal_equity_fraction(&self.intraday.price_tracker, symbol)
                 })
                 .sum::<Decimal>();
 
             if fraction < config.trading.minimum_position_equity_fraction {
                 equities.push(Decimal::ZERO);
-                continue;
+            } else {
+                equities.push(fraction * usable_equity);
             }
-
-            equities.push(fraction * usable_equity);
         }
 
         Ok(equities)
@@ -187,70 +180,90 @@ impl Engine {
         let hist = self
             .local_history
             .get_market_history(Timeframe::DaysBeforeNow(3))
-            .await?;
-        let pm = &mut self.intraday.portfolio_manager;
-        let key_to_index = pm
-            .long
-            .iter()
-            .enumerate()
-            .map(|(index, strategy)| (RefCell::borrow(&**strategy).key(), index))
+            .await?
+            .into_iter()
+            .flat_map(|(symbol, bars)| {
+                (bars.len() >= 2).then(|| {
+                    let n = bars.len();
+                    (symbol, bars[n - 1].close / bars[n - 2].close)
+                })
+            })
             .collect::<HashMap<_, _>>();
+        let pm = &mut self.intraday.portfolio_manager;
 
-        info!("Updating strategy weights");
-        let mut returns = vec![Decimal::ZERO; pm.long.len()];
+        let mut returns = HashMap::new();
         for (symbol, split) in &pm.initial_long_fractions {
-            let bars = hist.get(symbol).map(|bars| &**bars).unwrap_or(&[]);
-            let r = if bars.len() >= 2 {
-                let n = bars.len();
-                bars[n - 1].close / bars[n - 2].close
-            } else {
+            let r = hist.get(symbol).copied().unwrap_or_else(|| {
                 warn!("Insufficient history for symbol {symbol}, assuming return of 1");
                 Decimal::ONE
-            };
+            });
 
             debug!("Return of {symbol}: {r}");
 
-            for (index, fraction) in split.iter().copied().enumerate() {
-                returns[index] += fraction * r;
+            for (&key, fraction) in split {
+                *returns.entry(key).or_insert(Decimal::ZERO) += fraction * r;
             }
         }
 
         // Print out the individual returns for each strategy
         let mut combined_return = Decimal::ZERO;
-        let phi = pm.long_weights.iter().sum::<Decimal>();
-        for (key, index) in key_to_index {
-            let r = returns[index];
+        let phi = pm
+            .long
+            .values()
+            .map(|strategy| strategy.effective_weight())
+            .sum::<Decimal>();
+        for (&key, strategy) in &pm.long {
+            let r = returns[key];
             debug!("Return of {key}: {}", r);
-            combined_return += r * (pm.long_weights[index] / phi);
+            combined_return += r * (strategy.effective_weight() / phi);
         }
-        let cash_fraction = Config::get().trading.minimum_cash_fraction;
+        let cash_fraction = Config::get().trading.target_cash_fraction;
         let expected_return = combined_return + cash_fraction - combined_return * cash_fraction;
         debug!("Combined expected portfolio return: {expected_return}");
 
-        if !pm.initial_long_fractions.is_empty() {
-            pm.long_weights.iter_mut().zip(returns).for_each(|(w, r)| {
-                *w *= mwu_multiplier(Delta::Return(r), ETA);
-            });
+        let dbl_total_equity = pm.dbl_equity_at_close.total();
+        if dbl_total_equity > Decimal::ZERO {
+            let mut actual_fractions_combined_return =
+                pm.dbl_equity_at_close.cash / dbl_total_equity;
+            for (symbol, &value) in &pm.dbl_equity_at_close.long {
+                let r = hist.get(symbol).copied().unwrap_or_else(|| {
+                    warn!("Insufficient history for symbol {symbol}, assuming return of 1");
+                    Decimal::ONE
+                });
+                actual_fractions_combined_return += (value / dbl_total_equity) * r;
+            }
+            debug!(
+                "Expected portfolio return using day-before-last equity fractions: {}",
+                actual_fractions_combined_return
+            );
         }
 
-        let long = pm.long.clone();
-        let num_long = long.len();
+        info!("Updating strategy weights");
+        if !pm.initial_long_fractions.is_empty() {
+            for (&key, strategy) in pm.long.iter_mut() {
+                strategy.weight_update(returns[key]);
+            }
+        }
+
         let mut initial_long_fractions = HashMap::new();
-        for (index, strategy) in long.into_iter().enumerate() {
-            let mut strategy = RefCell::borrow_mut(&*strategy);
+        for (&key, strategy) in &self.intraday.portfolio_manager.long {
             strategy.on_pre_open(self).await?;
             for symbol in strategy.candidates() {
                 let fraction =
                     strategy.optimal_equity_fraction(&self.intraday.price_tracker, symbol);
                 initial_long_fractions
                     .entry(symbol)
-                    .or_insert_with(|| vec![Decimal::ZERO; num_long])[index] = fraction;
+                    .or_insert_with(HashMap::new)
+                    .insert(key, fraction);
             }
         }
 
         debug!(
             "Long fractions sum: {}",
-            initial_long_fractions.values().flatten().sum::<Decimal>()
+            initial_long_fractions
+                .values()
+                .flat_map(|split| split.values())
+                .sum::<Decimal>()
         );
 
         let pm = &mut self.intraday.portfolio_manager;
@@ -260,23 +273,160 @@ impl Engine {
     }
 
     pub fn portfolio_manager_on_close(&mut self) {
-        let current_equity = self.intraday.last_account.equity;
-        let last_equity = self.intraday.portfolio_manager.last_equity_at_close;
+        let current_equity = self.equity();
+        let pm = &mut self.intraday.portfolio_manager;
+        let total_last_equity = pm.last_equity_at_close.total();
 
-        if last_equity > Decimal::ZERO {
+        if total_last_equity > Decimal::ZERO {
             debug!(
                 "Combined actual portfolio return: {}",
-                current_equity / last_equity
+                current_equity.total() / total_last_equity
             );
         }
 
-        self.intraday.portfolio_manager.last_equity_at_close = current_equity;
+        pm.dbl_equity_at_close = mem::replace(&mut pm.last_equity_at_close, current_equity);
     }
 }
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct PortfolioManagerMetadata {
-    long_weights: HashMap<String, Decimal>,
+    long: HashMap<String, StrategyMeta>,
     initial_long_fractions: HashMap<Symbol, HashMap<String, Decimal>>,
-    last_equity_at_close: Decimal,
+    #[serde(default)]
+    last_equity_at_close: Equity,
+    #[serde(default)]
+    dbl_equity_at_close: Equity,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct Equity {
+    cash: Decimal,
+    long: HashMap<Symbol, Decimal>,
+}
+
+impl Equity {
+    fn total(&self) -> Decimal {
+        self.cash + self.long.values().sum::<Decimal>()
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy)]
+struct StrategyMeta {
+    weight: Decimal,
+    state: StrategyState,
+}
+
+impl StrategyMeta {
+    fn effective_weight(&self) -> Decimal {
+        match self.state {
+            StrategyState::Active | StrategyState::Liquidated => self.weight,
+            StrategyState::Disabled => Decimal::ZERO,
+        }
+    }
+}
+
+impl Default for StrategyMeta {
+    fn default() -> Self {
+        Self {
+            weight: Decimal::ONE,
+            state: StrategyState::Active,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct Strategy {
+    #[serde(serialize_with = "Strategy::serialize_inner")]
+    inner: RefCell<Box<dyn LongPortfolioStrategy>>,
+    meta: StrategyMeta,
+}
+
+impl Strategy {
+    fn new(inner: Box<dyn LongPortfolioStrategy>, meta: StrategyMeta) -> Self {
+        Self {
+            inner: RefCell::new(inner),
+            meta,
+        }
+    }
+
+    fn into_metadata(self) -> StrategyMeta {
+        self.meta
+    }
+
+    fn serialize_inner<S>(
+        inner: &RefCell<Box<dyn LongPortfolioStrategy>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let inner_ref = inner.borrow();
+        let value = match inner_ref.as_json_value() {
+            Ok(value) => value,
+            Err(error) => {
+                error!(
+                    "Failed to serialize date for strategy {}: {error}",
+                    inner_ref.key()
+                );
+                Value::Null
+            }
+        };
+        value.serialize(serializer)
+    }
+
+    fn get_state(&self) -> StrategyState {
+        self.meta.state
+    }
+
+    fn set_state(&mut self, state: StrategyState) -> StrategyState {
+        mem::replace(&mut self.meta.state, state)
+    }
+
+    fn effective_weight(&self) -> Decimal {
+        self.meta.effective_weight()
+    }
+
+    fn latest_effective_weight(&self, price_tracker: &PriceTracker) -> Decimal {
+        self.effective_weight()
+            * mwu_multiplier(
+                Delta::Return(self.inner.borrow().intraday_return(price_tracker)),
+                ETA,
+            )
+    }
+
+    fn weight_update(&mut self, r: Decimal) {
+        self.meta.weight *= mwu_multiplier(Delta::Return(r), ETA);
+    }
+
+    fn candidates(&self) -> Vec<Symbol> {
+        self.inner.borrow().candidates()
+    }
+
+    fn effective_candidates(&self) -> Vec<Symbol> {
+        match self.meta.state {
+            StrategyState::Active => self.inner.borrow().candidates(),
+            StrategyState::Liquidated | StrategyState::Disabled => Vec::new(),
+        }
+    }
+
+    fn optimal_equity_fraction(&self, price_tracker: &PriceTracker, symbol: Symbol) -> Decimal {
+        match self.meta.state {
+            StrategyState::Active => self
+                .inner
+                .borrow()
+                .optimal_equity_fraction(price_tracker, symbol),
+            StrategyState::Liquidated | StrategyState::Disabled => Decimal::ZERO,
+        }
+    }
+
+    async fn on_pre_open(&self, engine: &Engine) -> anyhow::Result<()> {
+        self.inner.borrow_mut().on_pre_open(engine).await
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StrategyState {
+    Active,
+    Liquidated,
+    Disabled,
 }

@@ -16,5 +16,7 @@ pub trait LongPortfolioStrategy {
 
     fn optimal_equity_fraction(&self, price_tracker: &PriceTracker, symbol: Symbol) -> Decimal;
 
+    fn intraday_return(&self, price_tracker: &PriceTracker) -> Decimal;
+
     async fn on_pre_open(&mut self, engine: &Engine) -> anyhow::Result<()>;
 }

@@ -90,13 +90,30 @@ pub enum Command {
     BuyToggle { allow: bool },
     CurrentTrackedSymbols,
     EngineDump,
+    Liquidate,
+    PortfolioStrategy(PortfolioStrategySubcommand),
     PriceInfo { symbol: Symbol },
     RunPreOpen,
     RepairRecords { symbols: Vec<Symbol> },
     Status,
     Stop,
+    Tax(TaxSubcommand),
     UpdateHistory { max_updates: Option<NonZeroUsize> },
     UntrackedSymbols,
+}
+
+#[derive(Debug)]
+pub enum TaxSubcommand {
+    Update,
+    Evaluate { calendar_year: i32 },
+}
+
+#[derive(Debug)]
+pub enum PortfolioStrategySubcommand {
+    List,
+    Enable { key: String },
+    Liquidate { key: String },
+    Disable { key: String },
 }
 
 #[derive(Debug)]

@@ -255,8 +255,10 @@ pub struct TradingConfig {
     pub seconds_per_tick: u64,
     pub minimum_median_volume: u64,
     pub minimum_cash_fraction: Decimal,
+    pub target_cash_fraction: Decimal,
     pub minimum_position_equity_fraction: Decimal,
     pub minimum_trade_equity_fraction: Decimal,
+    pub tsl_kill_threshold: Decimal,
     pub eta: Decimal,
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     pub blacklist: HashSet<Symbol>,
@@ -268,9 +270,11 @@ impl Default for TradingConfig {
             pre_open_hours_offset: 3,
             seconds_per_tick: 10,
             minimum_median_volume: 750_000,
-            minimum_cash_fraction: Decimal::new(5, 2),
+            minimum_cash_fraction: Decimal::new(1, 2),
+            target_cash_fraction: Decimal::new(25, 3),
             minimum_position_equity_fraction: Decimal::new(5, 2),
             minimum_trade_equity_fraction: Decimal::new(1, 2),
+            tsl_kill_threshold: Decimal::new(5, 1),
             eta: Decimal::ONE,
             blacklist: HashSet::new(),
         }
