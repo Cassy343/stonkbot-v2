@@ -17,7 +17,7 @@ use entity::{
     data::Bar,
     trading::{Account, AssetStatus, Position},
 };
-use history::{self, LocalHistory, LocalHistoryImpl};
+use history::{LocalHistory, LocalHistoryImpl};
 use log::{debug, error, info, log, trace, warn, Level};
 use rest::AlpacaRestApi;
 use rust_decimal::Decimal;
@@ -391,6 +391,11 @@ impl Engine {
     }
 
     async fn tick_watchdog(&mut self) {
+        // TODO: remove
+        if self.intraday.last_position_map.is_empty() {
+            self.enter_safety_mode();
+        }
+
         if self.liquidate {
             self.liquidate_open_positions().await;
         } else {

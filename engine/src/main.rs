@@ -6,7 +6,6 @@ mod portfolio;
 use anyhow::Context;
 use common::config::Config;
 use event::*;
-use event::{Command, EventReceiver};
 use log::error;
 use rest::AlpacaRestApi;
 use rustyline::history::FileHistory;

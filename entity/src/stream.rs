@@ -15,8 +15,11 @@ pub enum StreamMessage {
     Error { code: u16, msg: String },
     #[serde(rename = "subscription")]
     Subscription {
+        #[serde(default)]
         trades: Vec<Symbol>,
+        #[serde(default)]
         quotes: Vec<Symbol>,
+        #[serde(default)]
         bars: Vec<Symbol>,
     },
     #[serde(rename = "b")]

@@ -1,10 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::{cell::RefCell, mem};
 
-use common::{
-    config::Config,
-    mwu::{mwu_multiplier, Delta},
-};
+use common::{config::Config, mwu::Delta};
 use history::{LocalHistory, Timeframe};
 use log::{debug, error, info, warn};
 use rust_decimal::Decimal;
@@ -12,7 +9,9 @@ use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use stock_symbol::Symbol;
 
-use crate::portfolio::{make_long_portfolio, LongPortfolioStrategy};
+use crate::portfolio::{
+    make_long_portfolio, Expert, LongPortfolioStrategy, Mwu, Weighted, WeightedMut,
+};
 
 use super::engine_impl::Engine;
 use super::PriceTracker;
@@ -21,7 +20,7 @@ const ETA: f64 = 0.8;
 
 #[derive(Serialize)]
 pub struct PortfolioManager {
-    long: HashMap<&'static str, Strategy>,
+    long: Mwu<&'static str, Strategy, f64>,
     initial_long_fractions: HashMap<Symbol, HashMap<&'static str, Decimal>>,
     last_equity_at_close: Equity,
     // Day before last
@@ -30,7 +29,8 @@ pub struct PortfolioManager {
 
 impl PortfolioManager {
     pub fn new(meta: PortfolioManagerMetadata) -> anyhow::Result<Self> {
-        let long = make_long_portfolio()?
+        let mut long = Mwu::new(ETA);
+        long.experts = make_long_portfolio()?
             .into_iter()
             .map(|inner| {
                 let key = inner.key();
@@ -39,7 +39,7 @@ impl PortfolioManager {
                     Strategy::new(inner, meta.long.get(key).cloned().unwrap_or_default()),
                 )
             })
-            .collect::<HashMap<_, _>>();
+            .collect();
 
         let initial_long_fractions = meta
             .initial_long_fractions
@@ -47,7 +47,8 @@ impl PortfolioManager {
             .map(|(symbol, split)| {
                 (
                     symbol,
-                    long.keys()
+                    long.experts
+                        .keys()
                         .map(|&key| (key, split.get(key).copied().unwrap_or(Decimal::ZERO)))
                         .collect(),
                 )
@@ -64,12 +65,14 @@ impl PortfolioManager {
 
     pub fn candidates(&self) -> impl Iterator<Item = Symbol> + '_ {
         self.long
+            .experts
             .values()
             .flat_map(|strategy| strategy.effective_candidates())
     }
 
     pub fn strategies(&self) -> BTreeMap<&'static str, StrategyState> {
         self.long
+            .experts
             .iter()
             .map(|(&key, strategy)| (key, strategy.get_state()))
             .collect()
@@ -77,6 +80,7 @@ impl PortfolioManager {
 
     pub fn set_strategy_state(&mut self, key: &str, state: StrategyState) -> Option<StrategyState> {
         self.long
+            .experts
             .get_mut(key)
             .map(|strategy| strategy.set_state(state))
     }
@@ -85,6 +89,7 @@ impl PortfolioManager {
         PortfolioManagerMetadata {
             long: self
                 .long
+                .experts
                 .into_iter()
                 .map(|(key, strategy)| (key.to_owned(), strategy.into_metadata()))
                 .collect(),
@@ -104,6 +109,95 @@ impl PortfolioManager {
             last_equity_at_close: self.last_equity_at_close,
             dbl_equity_at_close: self.dbl_equity_at_close,
         }
+    }
+
+    fn strategy_returns(
+        &self,
+        lastday_returns: &HashMap<Symbol, Decimal>,
+    ) -> HashMap<&'static str, Decimal> {
+        let mut returns = HashMap::with_capacity(self.long.experts.len());
+        for (symbol, split) in &self.initial_long_fractions {
+            let r = lastday_returns.get(symbol).copied().unwrap_or_else(|| {
+                warn!("Insufficient history for symbol {symbol}, assuming return of 1");
+                Decimal::ONE
+            });
+
+            debug!("Return of {symbol}: {r}");
+
+            for (&key, fraction) in split {
+                *returns.entry(key).or_insert(Decimal::ZERO) += fraction * r;
+            }
+        }
+
+        self.long.experts.keys().for_each(|&key| {
+            returns.entry(key).or_insert(Decimal::ONE);
+        });
+
+        returns
+    }
+
+    fn log_expected_returns(&self, strategy_returns: &HashMap<&'static str, Decimal>) {
+        // Print out the individual returns for each strategy and aggregate the expected return
+        let expected_return = self.long.loss(|&key, _| {
+            let r = strategy_returns[key];
+            debug!("Return of {key}: {r}");
+            r
+        });
+
+        let cash_fraction = Config::get().trading.target_cash_fraction;
+        let cash_adj_expected_return =
+            expected_return + cash_fraction - expected_return * cash_fraction;
+        debug!("Combined expected portfolio return: {cash_adj_expected_return}");
+    }
+
+    fn log_dbl_expected_returns(&self, lastday_returns: &HashMap<Symbol, Decimal>) {
+        if self.dbl_equity_at_close.is_empty() {
+            return;
+        }
+
+        let dbl_total_equity = self.dbl_equity_at_close.total();
+        if dbl_total_equity > Decimal::ZERO {
+            let mut actual_fractions_combined_return =
+                self.dbl_equity_at_close.cash / dbl_total_equity;
+            for (symbol, &value) in &self.dbl_equity_at_close.long {
+                let r = lastday_returns.get(symbol).copied().unwrap_or_else(|| {
+                    warn!("Insufficient history for symbol {symbol}, assuming return of 1");
+                    Decimal::ONE
+                });
+                actual_fractions_combined_return += (value / dbl_total_equity) * r;
+            }
+            debug!(
+                "Expected portfolio return using day-before-last equity fractions: {}",
+                actual_fractions_combined_return
+            );
+        }
+    }
+
+    fn update_strategy_weights(&mut self, strategy_returns: &HashMap<&'static str, Decimal>) {
+        self.long
+            .weight_update(|key, _| Delta::Return(strategy_returns[key]));
+    }
+
+    fn update_initial_long_fractions(&mut self) {
+        self.initial_long_fractions.clear();
+
+        for (&key, strategy) in &self.long.experts {
+            for symbol in strategy.candidates() {
+                let fraction = strategy.optimal_equity_fraction(symbol);
+                self.initial_long_fractions
+                    .entry(symbol)
+                    .or_insert_with(HashMap::new)
+                    .insert(key, fraction);
+            }
+        }
+
+        debug!(
+            "Long fractions sum: {}",
+            self.initial_long_fractions
+                .values()
+                .flat_map(|split| split.values())
+                .sum::<Decimal>()
+        );
     }
 }
 
@@ -126,27 +220,13 @@ impl Engine {
         let pm = &self.intraday.portfolio_manager;
         let pt = &self.intraday.price_tracker;
 
-        let latest_weights = pm
-            .long
-            .iter()
-            .map(|(&key, strategy)| (key, strategy.latest_effective_weight(pt)))
-            .collect::<HashMap<_, _>>();
-        let phi = latest_weights.values().sum::<Decimal>();
-
         let config = Config::get();
         let total_equity = self.intraday.last_account.equity;
         let usable_equity = (Decimal::ONE - config.trading.target_cash_fraction) * total_equity;
         let mut equities = Vec::with_capacity(symbols.len());
 
         for &symbol in symbols {
-            let fraction = pm
-                .long
-                .iter()
-                .map(|(key, strategy)| {
-                    (latest_weights[key] / phi)
-                        * strategy.optimal_equity_fraction(&self.intraday.price_tracker, symbol)
-                })
-                .sum::<Decimal>();
+            let fraction = pm.long.latest_optimal_equity_fraction(pt, symbol);
 
             if fraction < config.trading.minimum_position_equity_fraction {
                 equities.push(Decimal::ZERO);
@@ -173,11 +253,8 @@ impl Engine {
         )
     }
 
-    pub async fn portfolio_manager_on_pre_open(&mut self) -> anyhow::Result<()> {
-        info!("Running portfolio manager pre-open tasks");
-
-        info!("Fetching recent market history");
-        let hist = self
+    async fn get_lastday_returns(&self) -> anyhow::Result<HashMap<Symbol, Decimal>> {
+        Ok(self
             .local_history
             .get_market_history(Timeframe::DaysBeforeNow(3))
             .await?
@@ -188,86 +265,32 @@ impl Engine {
                     (symbol, bars[n - 1].close / bars[n - 2].close)
                 })
             })
-            .collect::<HashMap<_, _>>();
+            .collect())
+    }
+
+    pub async fn portfolio_manager_on_pre_open(&mut self) -> anyhow::Result<()> {
+        info!("Running portfolio manager pre-open tasks");
+
+        info!("Fetching recent market history");
+        let lastday_returns = self.get_lastday_returns().await?;
         let pm = &mut self.intraday.portfolio_manager;
+        let strategy_returns = pm.strategy_returns(&lastday_returns);
 
-        let mut returns = HashMap::new();
-        for (symbol, split) in &pm.initial_long_fractions {
-            let r = hist.get(symbol).copied().unwrap_or_else(|| {
-                warn!("Insufficient history for symbol {symbol}, assuming return of 1");
-                Decimal::ONE
-            });
-
-            debug!("Return of {symbol}: {r}");
-
-            for (&key, fraction) in split {
-                *returns.entry(key).or_insert(Decimal::ZERO) += fraction * r;
-            }
-        }
-
-        // Print out the individual returns for each strategy
-        let mut combined_return = Decimal::ZERO;
-        let phi = pm
-            .long
-            .values()
-            .map(|strategy| strategy.effective_weight())
-            .sum::<Decimal>();
-        for (&key, strategy) in &pm.long {
-            let r = returns[key];
-            debug!("Return of {key}: {}", r);
-            combined_return += r * (strategy.effective_weight() / phi);
-        }
-        let cash_fraction = Config::get().trading.target_cash_fraction;
-        let expected_return = combined_return + cash_fraction - combined_return * cash_fraction;
-        debug!("Combined expected portfolio return: {expected_return}");
-
-        let dbl_total_equity = pm.dbl_equity_at_close.total();
-        if dbl_total_equity > Decimal::ZERO {
-            let mut actual_fractions_combined_return =
-                pm.dbl_equity_at_close.cash / dbl_total_equity;
-            for (symbol, &value) in &pm.dbl_equity_at_close.long {
-                let r = hist.get(symbol).copied().unwrap_or_else(|| {
-                    warn!("Insufficient history for symbol {symbol}, assuming return of 1");
-                    Decimal::ONE
-                });
-                actual_fractions_combined_return += (value / dbl_total_equity) * r;
-            }
-            debug!(
-                "Expected portfolio return using day-before-last equity fractions: {}",
-                actual_fractions_combined_return
-            );
-        }
+        pm.log_expected_returns(&strategy_returns);
+        pm.log_dbl_expected_returns(&lastday_returns);
 
         info!("Updating strategy weights");
-        if !pm.initial_long_fractions.is_empty() {
-            for (&key, strategy) in pm.long.iter_mut() {
-                strategy.weight_update(returns[key]);
-            }
-        }
+        pm.update_strategy_weights(&strategy_returns);
 
-        let mut initial_long_fractions = HashMap::new();
-        for (&key, strategy) in &self.intraday.portfolio_manager.long {
+        for strategy in self.intraday.portfolio_manager.long.experts.values() {
             strategy.on_pre_open(self).await?;
-            for symbol in strategy.candidates() {
-                let fraction =
-                    strategy.optimal_equity_fraction(&self.intraday.price_tracker, symbol);
-                initial_long_fractions
-                    .entry(symbol)
-                    .or_insert_with(HashMap::new)
-                    .insert(key, fraction);
-            }
         }
 
-        debug!(
-            "Long fractions sum: {}",
-            initial_long_fractions
-                .values()
-                .flat_map(|split| split.values())
-                .sum::<Decimal>()
-        );
-
-        let pm = &mut self.intraday.portfolio_manager;
-        pm.initial_long_fractions = initial_long_fractions;
+        // This needs to occur after we run on_pre_open for each strategy so that we get the
+        // fractions for today
+        self.intraday
+            .portfolio_manager
+            .update_initial_long_fractions();
 
         Ok(())
     }
@@ -305,6 +328,10 @@ struct Equity {
 }
 
 impl Equity {
+    fn is_empty(&self) -> bool {
+        self.long.is_empty()
+    }
+
     fn total(&self) -> Decimal {
         self.cash + self.long.values().sum::<Decimal>()
     }
@@ -339,6 +366,47 @@ struct Strategy {
     #[serde(serialize_with = "Strategy::serialize_inner")]
     inner: RefCell<Box<dyn LongPortfolioStrategy>>,
     meta: StrategyMeta,
+}
+
+impl Expert for Strategy {
+    type DataSource = PriceTracker;
+
+    fn intraday_return(&self, data_source: &Self::DataSource) -> Decimal {
+        self.inner.borrow().intraday_return(data_source)
+    }
+
+    fn optimal_equity_fraction(&self, symbol: Symbol) -> Decimal {
+        match self.meta.state {
+            StrategyState::Active => self.inner.borrow().optimal_equity_fraction(symbol),
+            StrategyState::Liquidated | StrategyState::Disabled => Decimal::ZERO,
+        }
+    }
+
+    fn latest_optimal_equity_fraction(
+        &self,
+        data_source: &PriceTracker,
+        symbol: Symbol,
+    ) -> Decimal {
+        match self.meta.state {
+            StrategyState::Active => self
+                .inner
+                .borrow()
+                .latest_optimal_equity_fraction(data_source, symbol),
+            StrategyState::Liquidated | StrategyState::Disabled => Decimal::ZERO,
+        }
+    }
+}
+
+impl Weighted for Strategy {
+    fn weight(&self) -> Decimal {
+        self.meta.effective_weight()
+    }
+}
+
+impl WeightedMut for Strategy {
+    fn weight_mut(&mut self) -> &mut Decimal {
+        &mut self.meta.weight
+    }
 }
 
 impl Strategy {
@@ -382,22 +450,6 @@ impl Strategy {
         mem::replace(&mut self.meta.state, state)
     }
 
-    fn effective_weight(&self) -> Decimal {
-        self.meta.effective_weight()
-    }
-
-    fn latest_effective_weight(&self, price_tracker: &PriceTracker) -> Decimal {
-        self.effective_weight()
-            * mwu_multiplier(
-                Delta::Return(self.inner.borrow().intraday_return(price_tracker)),
-                ETA,
-            )
-    }
-
-    fn weight_update(&mut self, r: Decimal) {
-        self.meta.weight *= mwu_multiplier(Delta::Return(r), ETA);
-    }
-
     fn candidates(&self) -> Vec<Symbol> {
         self.inner.borrow().candidates()
     }
@@ -406,16 +458,6 @@ impl Strategy {
         match self.meta.state {
             StrategyState::Active => self.inner.borrow().candidates(),
             StrategyState::Liquidated | StrategyState::Disabled => Vec::new(),
-        }
-    }
-
-    fn optimal_equity_fraction(&self, price_tracker: &PriceTracker, symbol: Symbol) -> Decimal {
-        match self.meta.state {
-            StrategyState::Active => self
-                .inner
-                .borrow()
-                .optimal_equity_fraction(price_tracker, symbol),
-            StrategyState::Liquidated | StrategyState::Disabled => Decimal::ZERO,
         }
     }
 
