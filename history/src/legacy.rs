@@ -309,7 +309,7 @@ impl SqliteLocalHistory {
         drop(dx_stream);
 
         let mut period_day_data_stream = sqlx::query(
-            "SELECT symbol,high,low,close,volume,changePercent FROM CS_Day WHERE pulldate >= ? \
+            "SELECT symbol,high,low,close,volume FROM CS_Day WHERE pulldate >= ? \
              ORDER BY pulldate DESC",
         )
         .bind(pulldates_desc[max_indicator_period - 1])
@@ -325,7 +325,6 @@ impl SqliteLocalHistory {
                             low: row.try_get("low")?,
                             close: row.try_get("close")?,
                             volume: row.try_get("volume")?,
-                            change_percent: row.try_get("changePercent")?,
                         })
                 }
                 None => {
@@ -1043,7 +1042,6 @@ mod entity {
         pub low: f64,
         pub close: f64,
         pub volume: i64,
-        pub change_percent: f64,
     }
 
     pub struct PeriodRange {
