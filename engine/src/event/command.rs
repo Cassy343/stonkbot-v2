@@ -88,7 +88,7 @@ fn parse_command(input: &str) -> Option<Command> {
     match command {
         "buytoggle" => buytoggle(&args),
         "cts" => Some(Command::CurrentTrackedSymbols),
-        "engdump" | "engine-dump" => Some(Command::EngineDump),
+        "dumpstate" => Some(Command::DumpState),
         "liquidate" => Some(Command::Liquidate),
         "pi" | "price-info" => price_info(&args),
         "ps" => portfolio_strategy(&args),

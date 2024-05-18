@@ -8,6 +8,8 @@ use futures::{
     Future, SinkExt, StreamExt,
 };
 use log::{debug, error, warn};
+use serde::Serialize;
+use serde_json::Value;
 use std::{
     borrow::Cow,
     collections::{BTreeSet, HashSet},
@@ -22,7 +24,7 @@ use tokio::{
 };
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 
-use common::config::Config;
+use common::{config::Config, util::serde_black_box};
 
 use super::{EventEmitter, StreamEvent};
 
@@ -91,7 +93,9 @@ async fn run_task(
         };
 
         match event {
-            IncomingEvent::Request(request) => handle_request(&mut stream, request).await,
+            IncomingEvent::Request(request) => {
+                handle_request(&mut stream, &mut emitter, request).await
+            }
             IncomingEvent::Message { message, epoch } => {
                 if stream.connection_epoch != epoch {
                     continue;
@@ -202,7 +206,11 @@ async fn handle_state_discrepancies(
     }
 }
 
-async fn handle_request(stream: &mut Stream, request: StreamRequest) {
+async fn handle_request(
+    stream: &mut Stream,
+    emitter: &mut EventEmitter<StreamEvent>,
+    request: StreamRequest,
+) {
     match request {
         StreamRequest::Open => {
             if !matches!(stream.state, StreamState::Closed) {
@@ -226,6 +234,17 @@ async fn handle_request(stream: &mut Stream, request: StreamRequest) {
                     warn!("Failed to send close message: {error:?}");
                 }
             }
+        }
+        StreamRequest::DumpState => {
+            let json = match serde_json::to_value(stream) {
+                Ok(json) => json,
+                Err(error) => {
+                    error!("Failed to serialize stream state: {error}");
+                    Value::Null
+                }
+            };
+
+            emitter.emit(StreamEvent::Dump { json });
         }
     }
 }
@@ -468,17 +487,21 @@ async fn handle_socket(
     );
 }
 
+#[derive(Serialize)]
 struct Stream {
     state: StreamState,
     connection_epoch: usize,
     expected_sub_state: SubscriptionState,
     actual_sub_state: SubscriptionState,
+    #[serde(serialize_with = "serde_black_box")]
     last_message_recv_time: Instant,
 }
 
+#[derive(Serialize)]
 enum StreamState {
     Opening,
     Open {
+        #[serde(serialize_with = "serde_black_box")]
         send: SplitSink<WebSocket, Message>,
         pong_pending: bool,
     },
@@ -512,9 +535,10 @@ pub enum StreamRequest {
     #[allow(dead_code)]
     UnsubscribeBars(Vec<Symbol>),
     Close,
+    DumpState,
 }
 
-#[derive(Clone)]
+#[derive(Serialize, Clone)]
 struct SubscriptionState {
     bars: BTreeSet<Symbol>,
     // Other fields not supported yet

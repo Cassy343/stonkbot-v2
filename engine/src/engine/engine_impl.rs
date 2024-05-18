@@ -13,7 +13,7 @@ use crate::{
     PortfolioStrategySubcommand, TaxSubcommand,
 };
 use anyhow::Context;
-use common::config::Config;
+use common::{config::Config, util::serde_black_box};
 use entity::{
     data::Bar,
     trading::{Account, AssetStatus, Position},
@@ -23,6 +23,7 @@ use log::{debug, error, info, log, trace, warn, Level};
 use rest::AlpacaRestApi;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -42,9 +43,9 @@ const METADATA_FILE: &str = "metadata.json";
 
 #[derive(Serialize)]
 pub struct Engine {
-    #[serde(skip)]
+    #[serde(serialize_with = "serde_black_box")]
     pub rest: AlpacaRestApi,
-    #[serde(skip)]
+    #[serde(serialize_with = "serde_black_box")]
     pub local_history: Arc<LocalHistoryImpl>,
     pub intraday: IntradayTracker,
     pub tax_tracker: TaxTracker,
@@ -507,20 +508,8 @@ impl Engine {
 
                 info!("Currently tracked symbols: {cts_string}")
             }
-            Command::EngineDump => {
-                let json = match serde_json::to_string_pretty(self) {
-                    Ok(json) => json,
-                    Err(error) => {
-                        error!("Failed to dump engine state to json: {error:?}");
-                        return;
-                    }
-                };
-
-                if let Err(error) = fs::write("engine.json", &json) {
-                    error!("Failed to write JSON to file, writing to console instead. {error:?}");
-                    info!("{json}");
-                }
-            }
+            // When the stream responds to this request we'll write the data out
+            Command::DumpState => self.intraday.stream.send(StreamRequest::DumpState),
             Command::Liquidate => self.liquidate(),
             Command::PortfolioStrategy(subcommand) => match subcommand {
                 PortfolioStrategySubcommand::List => {
@@ -587,10 +576,15 @@ impl Engine {
 
                     info!(
                         "Tax-aware gains and losses for {calendar_year}:\n\
-                        Net short-term gains: {:.2}\nNet long-term gains: {:.2}\n\
+                        Net short-term gains: {:.2} ({:.2} - {:.2})\n\
+                        Net long-term gains: {:.2} ({:.2} - {:.2})\n\
                         Dividends: {:.2}",
                         capital.short_term_gains - capital.short_term_losses,
+                        capital.short_term_gains,
+                        capital.short_term_losses,
                         capital.long_term_gains - capital.long_term_losses,
+                        capital.long_term_gains,
+                        capital.long_term_losses,
                         dividends
                     );
                 }
@@ -832,68 +826,95 @@ impl Engine {
     }
 
     async fn handle_stream_event(&mut self, event: StreamEvent) {
-        const FIVE_MINUTES: Duration = Duration::minutes(5);
-
         match event {
             StreamEvent::MinuteBar { symbol, bar } => {
-                let avg_span = self.get_avg_span(symbol).await;
-
-                if let Some(price_info) = self
-                    .intraday
-                    .price_tracker
-                    .record_price(symbol, avg_span, bar)
-                {
-                    let threshold = avg_span * 0.225;
-                    let mut log_trace_info = false;
-
-                    let sell_trigger = price_info.time_since_hwm >= FIVE_MINUTES
-                        && price_info.hwm_loss <= -threshold
-                        && price_info.hwm_loss > -2.0 * threshold;
-                    let buy_trigger = price_info.time_since_lwm >= FIVE_MINUTES
-                        && price_info.lwm_gain > threshold
-                        && price_info.lwm_gain < 2.0 * threshold;
-
-                    let (sell_trigger, buy_trigger) = match (sell_trigger, buy_trigger) {
-                        (true, true) => {
-                            if price_info.time_since_hwm < price_info.time_since_lwm {
-                                (true, false)
-                            } else {
-                                (false, true)
-                            }
-                        }
-                        (st, bt) => (st, bt),
-                    };
-
-                    if sell_trigger {
-                        trace!("Sending sell trigger for {symbol}");
-                        log_trace_info = true;
-
-                        if let Err(error) = self.position_sell_trigger(symbol).await {
-                            error!("Failed to handle position sell trigger: {error:?}");
-                        }
-                    }
-
-                    if buy_trigger {
-                        trace!("Sending buy trigger for {symbol}");
-                        log_trace_info = true;
-
-                        if let Err(error) = self.position_buy_trigger(symbol).await {
-                            error!("Failed to handle position buy trigger: {error:?}");
-                        }
-                    }
-
-                    if log_trace_info {
-                        trace!(
-                            "Average span for {symbol}: {avg_span:.4}, threshold: {threshold:.4}"
-                        );
-                        Self::log_price_info(symbol, &price_info, Level::Trace);
-                    }
-                }
+                self.handle_stream_minute_bar(symbol, bar).await;
             }
+            StreamEvent::Dump { json } => self.dump_state(&json),
         }
     }
 
     fn handle_stream_event_safe(&mut self, _event: StreamEvent) {
         self.intraday.stream.send(StreamRequest::Close);
+    }
+
+    async fn handle_stream_minute_bar(&mut self, symbol: Symbol, bar: Bar) {
+        const FIVE_MINUTES: Duration = Duration::minutes(5);
+
+        let avg_span = self.get_avg_span(symbol).await;
+
+        if let Some(price_info) = self
+            .intraday
+            .price_tracker
+            .record_price(symbol, avg_span, bar)
+        {
+            let threshold = avg_span * 0.225;
+            let mut log_trace_info = false;
+
+            let sell_trigger = price_info.time_since_hwm >= FIVE_MINUTES
+                && price_info.hwm_loss <= -threshold
+                && price_info.hwm_loss > -2.0 * threshold;
+            let buy_trigger = price_info.time_since_lwm >= FIVE_MINUTES
+                && price_info.lwm_gain > threshold
+                && price_info.lwm_gain < 2.0 * threshold;
+
+            let (sell_trigger, buy_trigger) = match (sell_trigger, buy_trigger) {
+                (true, true) => {
+                    if price_info.time_since_hwm < price_info.time_since_lwm {
+                        (true, false)
+                    } else {
+                        (false, true)
+                    }
+                }
+                (st, bt) => (st, bt),
+            };
+
+            if sell_trigger {
+                trace!("Sending sell trigger for {symbol}");
+                log_trace_info = true;
+
+                if let Err(error) = self.position_sell_trigger(symbol).await {
+                    error!("Failed to handle position sell trigger: {error:?}");
+                }
+            }
+
+            if buy_trigger {
+                trace!("Sending buy trigger for {symbol}");
+                log_trace_info = true;
+
+                if let Err(error) = self.position_buy_trigger(symbol).await {
+                    error!("Failed to handle position buy trigger: {error:?}");
+                }
+            }
+
+            if log_trace_info {
+                trace!("Average span for {symbol}: {avg_span:.4}, threshold: {threshold:.4}");
+                Self::log_price_info(symbol, &price_info, Level::Trace);
+            }
+        }
+    }
+
+    fn dump_state(&self, stream_json: &Value) {
+        let engine_json = match serde_json::to_value(self) {
+            Ok(json) => json,
+            Err(error) => {
+                error!("Failed to dump engine state to json: {error:?}");
+                return;
+            }
+        };
+
+        let aggregate = json!({
+            "config": Config::get(),
+            "engine": engine_json,
+            "stream": stream_json
+        });
+
+        match fs::write("statedump.json", &aggregate.to_string()) {
+            Ok(()) => info!("Wrote state to statedump.json"),
+            Err(error) => {
+                error!("Failed to write JSON to file, writing to console instead. {error:?}");
+                info!("{aggregate}");
+            }
+        }
     }
 }

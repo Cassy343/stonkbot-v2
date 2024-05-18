@@ -5,6 +5,7 @@ pub mod stream;
 use std::{fmt::Debug, marker::PhantomData, num::NonZeroUsize};
 
 use log::warn;
+use serde_json::Value;
 use stock_symbol::Symbol;
 use time::{Duration, OffsetDateTime};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -89,7 +90,7 @@ impl From<StreamEvent> for EngineEvent {
 pub enum Command {
     BuyToggle { allow: bool },
     CurrentTrackedSymbols,
-    EngineDump,
+    DumpState,
     Liquidate,
     PortfolioStrategy(PortfolioStrategySubcommand),
     PriceInfo { symbol: Symbol },
@@ -135,4 +136,5 @@ pub enum ClockEvent {
 #[derive(Debug)]
 pub enum StreamEvent {
     MinuteBar { symbol: Symbol, bar: Bar },
+    Dump { json: Value },
 }

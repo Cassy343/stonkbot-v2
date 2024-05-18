@@ -1,4 +1,5 @@
 use std::{
+    any::type_name_of_val,
     cmp::Ordering,
     fmt::{self, Display, Formatter},
 };
@@ -150,3 +151,11 @@ pub struct DateSerdeWrapper(
     )]
     pub Date,
 );
+
+pub fn serde_black_box<T, S>(value: &T, serializer: S) -> Result<S::Ok, S::Error>
+where
+    T: ?Sized,
+    S: Serializer,
+{
+    Serialize::serialize(type_name_of_val(value), serializer)
+}
