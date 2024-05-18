@@ -1,6 +1,6 @@
 use std::fmt::{self, Debug, Display, Formatter};
 
-use common::util::deserialize_date_from_str;
+use common::util::{deserialize_date_from_str, serialize_date_as_str};
 use rust_decimal::Decimal;
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -259,12 +259,25 @@ pub enum OrderClass {
     OneTriggersOther,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct DividendActivity {
-    #[serde(deserialize_with = "deserialize_date_from_str")]
+    #[serde(
+        serialize_with = "serialize_date_as_str",
+        deserialize_with = "deserialize_date_from_str"
+    )]
     pub date: Date,
     pub symbol: Symbol,
     pub net_amount: Decimal,
+}
+
+#[derive(Deserialize)]
+pub struct SpinoffActivity {
+    pub id: String,
+    #[serde(deserialize_with = "deserialize_date_from_str")]
+    pub date: Date,
+    pub symbol: Symbol,
+    pub qty: Decimal,
+    pub price: Decimal,
 }
 
 #[derive(Debug, Clone)]

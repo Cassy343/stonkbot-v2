@@ -5,6 +5,7 @@ use super::{
     trailing::{PriceInfo, PriceTracker},
 };
 use crate::{
+    engine::tax::TaxReport,
     event::{
         stream::{StreamRequest, StreamRequestSender},
         ClockEvent, Command, EngineEvent, EventReceiver, StreamEvent,
@@ -568,32 +569,21 @@ impl Engine {
                 }
             }
             Command::Tax(subcommand) => match subcommand {
-                TaxSubcommand::Update => match self.tax_tracker.ingest_orders(&self.rest).await {
+                TaxSubcommand::Update => match self.tax_tracker.ingest(&self.rest).await {
                     Ok(()) => info!("Successfully updated tax records"),
                     Err(error) => error!("Failed to update tax records: {error}"),
                 },
                 TaxSubcommand::Evaluate { calendar_year } => {
-                    let capital = match self.tax_tracker.tax_aware_capital(calendar_year) {
-                        Ok(capital) => capital,
+                    let TaxReport {
+                        trades: capital,
+                        dividends,
+                    } = match self.tax_tracker.tax_report(calendar_year) {
+                        Ok(report) => report,
                         Err(error) => {
-                            error!("Failed to compute tax-aware capital: {error}");
+                            error!("Failed to generate report: {error}");
                             return;
                         }
                     };
-
-                    let dividends = match self.rest.dividends().await {
-                        Ok(divs) => divs,
-                        Err(error) => {
-                            error!("Failed to fetch dividends: {error}");
-                            return;
-                        }
-                    };
-
-                    let total_dividends = dividends
-                        .iter()
-                        .filter(|div| div.date.year() == calendar_year)
-                        .map(|div| div.net_amount)
-                        .sum::<Decimal>();
 
                     info!(
                         "Tax-aware gains and losses for {calendar_year}:\n\
@@ -601,7 +591,7 @@ impl Engine {
                         Dividends: {:.2}",
                         capital.short_term_gains - capital.short_term_losses,
                         capital.long_term_gains - capital.long_term_losses,
-                        total_dividends
+                        dividends
                     );
                 }
             },

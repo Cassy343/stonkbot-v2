@@ -155,10 +155,13 @@ impl AlpacaRestApi {
         .await
     }
 
-    pub async fn dividends(&self) -> anyhow::Result<Vec<DividendActivity>> {
+    pub async fn activities<A: DeserializeOwned>(
+        &self,
+        activity_type: &str,
+    ) -> anyhow::Result<Vec<A>> {
         Self::send(
             self.trading_endpoint(Method::GET, "/account/activities")
-                .query(&[("activity_types", "DIV")]),
+                .query(&[("activity_types", activity_type)]),
         )
         .await
     }

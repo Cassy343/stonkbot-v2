@@ -5,7 +5,7 @@ use std::{
 
 use anyhow::{anyhow, Context};
 use common::util::DateSerdeWrapper;
-use entity::trading::{Order, OrderSide, OrderStatus};
+use entity::trading::{DividendActivity, Order, OrderSide, OrderStatus, SpinoffActivity};
 use log::{debug, warn};
 use rest::{AlpacaRestApi, RequestOrderStatus};
 use rust_decimal::Decimal;
@@ -17,11 +17,19 @@ use uuid::Uuid;
 #[derive(Serialize, Deserialize, Default)]
 pub struct TaxTracker {
     ingested_orders: HashSet<Uuid>,
+    ingested_spinoffs: HashSet<String>,
     tax_history: HashMap<Symbol, SymbolTaxHistory>,
+    dividends: Vec<DividendActivity>,
 }
 
 impl TaxTracker {
-    pub async fn ingest_orders(&mut self, rest: &AlpacaRestApi) -> anyhow::Result<()> {
+    pub async fn ingest(&mut self, rest: &AlpacaRestApi) -> anyhow::Result<()> {
+        self.ingest_orders(rest).await?;
+        self.ingest_events(rest).await?;
+        Ok(())
+    }
+
+    async fn ingest_orders(&mut self, rest: &AlpacaRestApi) -> anyhow::Result<()> {
         let limit = 500;
         let mut after = OffsetDateTime::UNIX_EPOCH;
 
@@ -48,13 +56,28 @@ impl TaxTracker {
         Ok(())
     }
 
-    pub fn tax_aware_capital(&self, calendar_year: i32) -> anyhow::Result<Capital> {
-        let mut ret = Capital::new();
+    async fn ingest_events(&mut self, rest: &AlpacaRestApi) -> anyhow::Result<()> {
+        self.dividends = rest.activities("DIV").await?;
+        let spinoffs = rest.activities::<SpinoffActivity>("SPIN").await?;
+        for spinoff in &spinoffs {
+            self.ingest_spinoff_adjustment(spinoff);
+        }
+        Ok(())
+    }
+
+    pub fn tax_report(&self, calendar_year: i32) -> anyhow::Result<TaxReport> {
+        let mut ret = TaxReport::new();
         for (&symbol, history) in &self.tax_history {
-            ret += history
-                .tax_aware_capital(calendar_year)
+            ret.trades += history
+                .tax_report(calendar_year)
                 .with_context(|| format!("Failed to compute tax-aware capital for {symbol}"))?;
         }
+        ret.dividends = self
+            .dividends
+            .iter()
+            .filter(|div| div.date.year() == calendar_year)
+            .map(|div| div.net_amount)
+            .sum::<Decimal>();
         Ok(ret)
     }
 
@@ -84,6 +107,19 @@ impl TaxTracker {
             .ingest_order(order);
         self.ingested_orders.insert(order.id);
     }
+
+    fn ingest_spinoff_adjustment(&mut self, spinoff: &SpinoffActivity) {
+        // Already ingested
+        if self.ingested_spinoffs.contains(&spinoff.id) {
+            return;
+        }
+
+        self.tax_history
+            .entry(spinoff.symbol)
+            .or_insert_with(SymbolTaxHistory::new)
+            .ingest_spinoff(spinoff);
+        self.ingested_spinoffs.insert(spinoff.id.clone());
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -108,89 +144,166 @@ impl SymbolTaxHistory {
             shares: order.filled_qty.expect("filled_qty not present"),
         };
 
-        let event = self
+        let txns = &mut self
             .history
             .entry(DateSerdeWrapper(date))
-            .or_insert_with(TaxEvent::new);
+            .or_insert_with(TaxEvent::default)
+            .standard;
 
         match order.side {
-            OrderSide::Buy => event.average_in_buy(transaction),
-            OrderSide::Sell => event.average_in_sell(transaction),
+            OrderSide::Buy => txns.average_in_buy(transaction),
+            OrderSide::Sell => txns.average_in_sell(transaction),
         }
     }
 
-    fn tax_aware_capital(&self, calendar_year: i32) -> anyhow::Result<Capital> {
-        let mut capital = Capital::new();
-        let mut purchases: VecDeque<(Date, SecurityTransaction)> = VecDeque::new();
+    fn ingest_spinoff(&mut self, spinoff: &SpinoffActivity) {
+        let transaction = SecurityTransaction {
+            avg_price: spinoff.price,
+            shares: spinoff.qty.abs(),
+        };
+
+        let txns = &mut self
+            .history
+            .entry(DateSerdeWrapper(spinoff.date))
+            .or_insert_with(TaxEvent::default)
+            .paper;
+
+        if spinoff.qty < Decimal::ZERO {
+            txns.average_in_sell(transaction)
+        } else {
+            txns.average_in_buy(transaction)
+        }
+    }
+
+    fn tax_report(&self, calendar_year: i32) -> anyhow::Result<Capital> {
+        let mut builder = SymbolTaxReportBuilder::new(calendar_year);
 
         for (&DateSerdeWrapper(date), event) in &self.history {
-            if let Some(sale) = event.sell {
-                let mut unmatched_shares = sale.shares;
+            if let Some(sale) = event.paper.sell {
+                builder.ingest_sale(date, sale, true)?;
+            }
 
-                while unmatched_shares > Decimal::ZERO {
-                    let (purchase_date, purchase) = purchases.front_mut().ok_or_else(|| {
-                        anyhow!(
-                            "Attempted to match sale of security on {} with purchase, \
+            if let Some(purchase) = event.paper.buy {
+                builder.ingest_purchase(date, purchase, true)?;
+            }
+
+            if let Some(sale) = event.standard.sell {
+                builder.ingest_sale(date, sale, false)?;
+            }
+
+            if let Some(purchase) = event.standard.buy {
+                builder.ingest_purchase(date, purchase, false)?;
+            }
+        }
+
+        Ok(builder.into_capital())
+    }
+}
+
+struct SymbolTaxReportBuilder {
+    capital: Capital,
+    purchases: VecDeque<(Date, SecurityTransaction)>,
+    calendar_year: i32,
+}
+
+impl SymbolTaxReportBuilder {
+    fn new(calendar_year: i32) -> Self {
+        Self {
+            capital: Capital::new(),
+            purchases: VecDeque::new(),
+            calendar_year,
+        }
+    }
+
+    fn ingest_sale(
+        &mut self,
+        date: Date,
+        sale: SecurityTransaction,
+        paper: bool,
+    ) -> anyhow::Result<()> {
+        let mut unmatched_shares = sale.shares;
+
+        while unmatched_shares > Decimal::ZERO {
+            let (purchase_date, purchase) = self.purchases.front_mut().ok_or_else(|| {
+                anyhow!(
+                    "Attempted to match sale of security on {} with purchase, \
                             but no purchases were found",
-                            date
-                        )
-                    })?;
-                    let purchase_date = *purchase_date;
-                    let sale_date = date;
+                    date
+                )
+            })?;
+            let purchase_date = *purchase_date;
+            let sale_date = date;
 
-                    let matched_shares = Decimal::min(unmatched_shares, purchase.shares);
+            let matched_shares = Decimal::min(unmatched_shares, purchase.shares);
 
-                    if sale_date.year() == calendar_year {
-                        let purchase_cost_basis = matched_shares * purchase.avg_price;
-                        let sale_cost_basis = matched_shares * sale.avg_price;
-                        let delta = sale_cost_basis - purchase_cost_basis;
+            if !paper && sale_date.year() == self.calendar_year {
+                let purchase_cost_basis = matched_shares * purchase.avg_price;
+                let sale_cost_basis = matched_shares * sale.avg_price;
+                let delta = sale_cost_basis - purchase_cost_basis;
 
-                        match (
-                            delta < Decimal::ZERO,
-                            is_at_least_one_year_apart(purchase_date, sale_date),
-                        ) {
-                            (true, true) => capital.long_term_losses -= delta,
-                            (true, false) => capital.short_term_losses -= delta,
-                            (false, true) => capital.long_term_gains += delta,
-                            (false, false) => capital.short_term_gains += delta,
-                        }
-                    }
-
-                    purchase.shares -= matched_shares;
-                    unmatched_shares -= matched_shares;
-
-                    if purchase.shares == Decimal::ZERO {
-                        purchases.pop_front().expect(
-                            "We were able to match the sale with a purchase, \
-                            so there should be a purchase to remove",
-                        );
-                    }
+                match (
+                    delta < Decimal::ZERO,
+                    is_at_least_one_year_apart(purchase_date, sale_date),
+                ) {
+                    (true, true) => self.capital.long_term_losses -= delta,
+                    (true, false) => self.capital.short_term_losses -= delta,
+                    (false, true) => self.capital.long_term_gains += delta,
+                    (false, false) => self.capital.short_term_gains += delta,
                 }
             }
 
-            if let Some(purchase) = event.buy {
-                purchases.push_back((date, purchase));
+            purchase.shares -= matched_shares;
+            unmatched_shares -= matched_shares;
+
+            if purchase.shares == Decimal::ZERO {
+                self.purchases.pop_front().expect(
+                    "We were able to match the sale with a purchase, \
+                            so there should be a purchase to remove",
+                );
             }
         }
 
-        Ok(capital)
+        Ok(())
+    }
+
+    fn ingest_purchase(
+        &mut self,
+        date: Date,
+        purchase: SecurityTransaction,
+        _paper: bool,
+    ) -> anyhow::Result<()> {
+        self.purchases.push_back((date, purchase));
+        Ok(())
+    }
+
+    fn into_capital(self) -> Capital {
+        self.capital
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
 struct TaxEvent {
+    #[serde(default, skip_serializing_if = "Transactions::is_empty")]
+    standard: Transactions,
+    #[serde(default, skip_serializing_if = "Transactions::is_empty")]
+    paper: Transactions,
+}
+
+#[derive(Serialize, Deserialize, Default)]
+struct Transactions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     buy: Option<SecurityTransaction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     sell: Option<SecurityTransaction>,
 }
 
-impl TaxEvent {
-    fn new() -> Self {
-        Self {
-            buy: None,
-            sell: None,
-        }
+impl Transactions {
+    fn is_empty(&self) -> bool {
+        self.buy.is_none() && self.sell.is_none()
     }
+}
 
+impl Transactions {
     fn average_in_buy(&mut self, buy: SecurityTransaction) {
         let transaction = match self.buy {
             Some(trans) => trans.average(&buy),
@@ -224,6 +337,21 @@ impl SecurityTransaction {
             avg_price: (self.avg_price * self.shares + other.avg_price * other.shares)
                 / total_shares,
             shares: total_shares,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TaxReport {
+    pub trades: Capital,
+    pub dividends: Decimal,
+}
+
+impl TaxReport {
+    pub fn new() -> Self {
+        Self {
+            trades: Capital::new(),
+            dividends: Decimal::ZERO,
         }
     }
 }
