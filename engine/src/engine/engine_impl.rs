@@ -1,25 +1,29 @@
 use super::{
-    entry::EntryStrategy,
     orders::OrderManager,
-    portfolio::{PortfolioManager, PortfolioManagerMetadata},
-    positions::{PositionManager, PositionManagerMetadata},
+    portfolio::{PortfolioManager, PortfolioManagerMetadata, StrategyState},
+    tax::TaxTracker,
     trailing::{PriceInfo, PriceTracker},
 };
-use crate::event::{
-    stream::{StreamRequest, StreamRequestSender},
-    ClockEvent, Command, EngineEvent, EventReceiver, StreamEvent,
+use crate::{
+    engine::tax::TaxReport,
+    event::{
+        stream::{StreamRequest, StreamRequestSender},
+        ClockEvent, Command, EngineEvent, EventReceiver, StreamEvent,
+    },
+    PortfolioStrategySubcommand, TaxSubcommand,
 };
 use anyhow::Context;
-use common::config::Config;
+use common::{config::Config, util::serde_black_box};
 use entity::{
     data::Bar,
     trading::{Account, AssetStatus, Position},
 };
-use history::{self, LocalHistory, LocalHistoryImpl};
+use history::{LocalHistory, LocalHistoryImpl};
 use log::{debug, error, info, log, trace, warn, Level};
 use rest::AlpacaRestApi;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -39,14 +43,16 @@ const METADATA_FILE: &str = "metadata.json";
 
 #[derive(Serialize)]
 pub struct Engine {
-    #[serde(skip)]
+    #[serde(serialize_with = "serde_black_box")]
     pub rest: AlpacaRestApi,
-    #[serde(skip)]
+    #[serde(serialize_with = "serde_black_box")]
     pub local_history: Arc<LocalHistoryImpl>,
     pub intraday: IntradayTracker,
-    pub position_manager: PositionManager,
+    pub tax_tracker: TaxTracker,
     pub in_safety_mode: bool,
+    pub liquidate: bool,
     pub clock_info: ClockInfo,
+    pub account_hwm: Decimal,
 }
 
 #[derive(Serialize)]
@@ -57,7 +63,6 @@ pub struct IntradayTracker {
     pub portfolio_manager: PortfolioManager,
     #[serde(skip)]
     pub stream: StreamRequestSender,
-    pub entry_strategy: EntryStrategy,
     pub last_position_map: HashMap<Symbol, Position>,
     pub last_account: Account,
 }
@@ -72,8 +77,11 @@ pub struct ClockInfo {
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct EngineMetadata {
-    pub position_metadata: PositionManagerMetadata,
     pub portfolio_metadata: PortfolioManagerMetadata,
+    #[serde(default)]
+    pub tax_tracker: TaxTracker,
+    #[serde(default)]
+    pub account_hwm: Option<Decimal>,
 }
 
 impl EngineMetadata {
@@ -139,7 +147,6 @@ pub async fn run(events: EventReceiver, rest: AlpacaRestApi, stream: StreamReque
     };
 
     let order_manager = OrderManager::new(rest.clone());
-    let position_manager = PositionManager::new(metadata.position_metadata);
 
     let (last_position_map, last_account) = match (rest.position_map().await, rest.account().await)
     {
@@ -158,6 +165,8 @@ pub async fn run(events: EventReceiver, rest: AlpacaRestApi, stream: StreamReque
         }
     };
 
+    let account_hwm = metadata.account_hwm.unwrap_or(last_account.equity);
+
     let mut engine = Engine {
         rest,
         local_history,
@@ -167,13 +176,14 @@ pub async fn run(events: EventReceiver, rest: AlpacaRestApi, stream: StreamReque
             order_manager,
             portfolio_manager,
             stream,
-            entry_strategy: EntryStrategy::new(),
             last_position_map,
             last_account,
         },
-        position_manager,
+        tax_tracker: metadata.tax_tracker,
         in_safety_mode: false,
+        liquidate: false,
         clock_info: ClockInfo::default(),
+        account_hwm,
     };
 
     engine.run(events).await;
@@ -187,9 +197,22 @@ pub async fn run(events: EventReceiver, rest: AlpacaRestApi, stream: StreamReque
 impl Engine {
     fn into_metadata(self) -> EngineMetadata {
         EngineMetadata {
-            position_metadata: self.position_manager.into_metadata(),
             portfolio_metadata: self.intraday.portfolio_manager.into_metadata(),
+            tax_tracker: self.tax_tracker,
+            account_hwm: Some(self.account_hwm),
         }
+    }
+
+    fn enter_safety_mode(&mut self) {
+        warn!("Entering safety mode");
+        self.in_safety_mode = true;
+        self.intraday.stream.send(StreamRequest::Close);
+    }
+
+    fn liquidate(&mut self) {
+        self.enter_safety_mode();
+        warn!("Liquidating account");
+        self.liquidate = true;
     }
 
     async fn run(&mut self, mut events: EventReceiver) {
@@ -198,7 +221,9 @@ impl Engine {
 
             match event {
                 EngineEvent::Clock(clock_event) => {
-                    if !self.in_safety_mode {
+                    if self.in_safety_mode {
+                        self.handle_clock_event_safe(clock_event).await;
+                    } else {
                         self.handle_clock_event(clock_event).await;
                     }
                 }
@@ -210,7 +235,9 @@ impl Engine {
                     self.handle_command(command).await;
                 }
                 EngineEvent::Stream(stream_event) => {
-                    if !self.in_safety_mode {
+                    if self.in_safety_mode {
+                        self.handle_stream_event_safe(stream_event);
+                    } else {
                         self.handle_stream_event(stream_event).await;
                     }
                 }
@@ -231,7 +258,7 @@ impl Engine {
 
                 if let Err(error) = self.on_pre_open().await {
                     error!("Failed to run pre-open tasks: {error:?}");
-                    self.in_safety_mode = true;
+                    self.enter_safety_mode();
                 }
             }
             ClockEvent::Open { next_close } => {
@@ -241,7 +268,7 @@ impl Engine {
                 self.intraday.stream.send(StreamRequest::Open);
                 if let Err(error) = self.on_open().await {
                     error!("Failed to run open tasks: {error:?}");
-                    self.in_safety_mode = true;
+                    self.enter_safety_mode();
                 }
             }
             ClockEvent::Tick {
@@ -260,7 +287,34 @@ impl Engine {
                 self.clock_info.next_open = Some(next_open);
 
                 self.intraday.stream.send(StreamRequest::Close);
-                self.on_close();
+                if let Err(error) = self.on_close().await {
+                    error!("Failed to run close tasks: {error:?}");
+                    self.enter_safety_mode();
+                }
+            }
+            ClockEvent::Panic => {
+                error!("Clock panicked");
+                self.enter_safety_mode();
+            }
+        }
+    }
+
+    async fn handle_clock_event_safe(&mut self, event: ClockEvent) {
+        match event {
+            ClockEvent::PreOpen => (),
+            ClockEvent::Open { next_close } => {
+                self.clock_info.next_close = Some(next_close);
+            }
+            ClockEvent::Tick {
+                duration_since_open,
+                duration_until_close,
+            } => {
+                self.clock_info.duration_since_open = Some(duration_since_open);
+                self.clock_info.duration_until_close = Some(duration_until_close);
+                self.tick_watchdog().await;
+            }
+            ClockEvent::Close { next_open } => {
+                self.clock_info.next_open = Some(next_open);
             }
             ClockEvent::Panic => {
                 error!("Clock panicked");
@@ -314,7 +368,6 @@ impl Engine {
             .collect();
 
         self.portfolio_manager_on_pre_open().await?;
-        self.position_manager_on_pre_open().await?;
 
         info!("Finished running pre-open tasks");
 
@@ -323,27 +376,63 @@ impl Engine {
 
     async fn on_open(&mut self) -> anyhow::Result<()> {
         self.update_account_info().await?;
-
         self.position_manager_on_open().await;
-        self.entry_strat_on_open().await;
-
         Ok(())
     }
 
     async fn on_tick(&mut self) -> anyhow::Result<()> {
         self.update_account_info().await?;
+        self.tick_watchdog().await;
 
         if let Err(error) = self.intraday.order_manager.on_tick().await {
             warn!("Failed to tick order manager: {error}");
         }
 
         self.position_manager_on_tick().await?;
-        self.entry_strat_on_tick().await?;
-
         Ok(())
     }
 
-    fn on_close(&mut self) {
+    async fn tick_watchdog(&mut self) {
+        // TODO: remove
+        if self.intraday.last_position_map.is_empty() {
+            self.enter_safety_mode();
+        }
+
+        if self.liquidate {
+            self.liquidate_open_positions().await;
+        } else {
+            let current_equity = self.intraday.last_account.equity;
+            self.account_hwm = Decimal::max(self.account_hwm, current_equity);
+
+            if self.account_hwm == Decimal::ZERO {
+                return;
+            }
+
+            let loss = current_equity / self.account_hwm;
+            let threshold = Config::get().trading.tsl_kill_threshold;
+            if loss <= threshold {
+                warn!("Trailing stop loss kill threshold reached: {loss} <= {threshold}");
+                self.liquidate();
+            }
+        }
+    }
+
+    async fn liquidate_open_positions(&mut self) {
+        for &symbol in self.intraday.last_position_map.keys() {
+            if self
+                .intraday
+                .order_manager
+                .trade_status(symbol)
+                .is_sell_daytrade_safe()
+            {
+                if let Err(error) = self.intraday.order_manager.liquidate(symbol).await {
+                    error!("Failed to liquidate position in {symbol}: {error}");
+                }
+            }
+        }
+    }
+
+    async fn on_close(&mut self) -> anyhow::Result<()> {
         self.intraday.order_manager.clear();
 
         let price_tracker_json = self.intraday.price_tracker.patched_json();
@@ -359,7 +448,11 @@ impl Engine {
         }
 
         self.intraday.price_tracker.clear();
+
+        self.update_account_info().await?;
         self.portfolio_manager_on_close();
+
+        Ok(())
     }
 
     pub async fn get_avg_span(&mut self, symbol: Symbol) -> f64 {
@@ -415,20 +508,25 @@ impl Engine {
 
                 info!("Currently tracked symbols: {cts_string}")
             }
-            Command::EngineDump => {
-                let json = match serde_json::to_string_pretty(self) {
-                    Ok(json) => json,
-                    Err(error) => {
-                        error!("Failed to dump engine state to json: {error:?}");
-                        return;
+            // When the stream responds to this request we'll write the data out
+            Command::DumpState => self.intraday.stream.send(StreamRequest::DumpState),
+            Command::Liquidate => self.liquidate(),
+            Command::PortfolioStrategy(subcommand) => match subcommand {
+                PortfolioStrategySubcommand::List => {
+                    if let Err(error) = self.list_portfolio_strategies() {
+                        error!("Failed to list portfolio strategies: {:?}", error);
                     }
-                };
-
-                if let Err(error) = fs::write("engine.json", &json) {
-                    error!("Failed to write JSON to file, writing to console instead. {error:?}");
-                    info!("{json}");
                 }
-            }
+                PortfolioStrategySubcommand::Enable { key } => {
+                    self.change_portfolio_strategy_state(&key, StrategyState::Active)
+                }
+                PortfolioStrategySubcommand::Liquidate { key } => {
+                    self.change_portfolio_strategy_state(&key, StrategyState::Liquidated)
+                }
+                PortfolioStrategySubcommand::Disable { key } => {
+                    self.change_portfolio_strategy_state(&key, StrategyState::Disabled)
+                }
+            },
             Command::PriceInfo { symbol } => {
                 let price_info = match self.intraday.price_tracker.price_info(symbol) {
                     Some(price_info) => price_info,
@@ -459,6 +557,38 @@ impl Engine {
                     error!("Failed to log status: {:?}", error);
                 }
             }
+            Command::Tax(subcommand) => match subcommand {
+                TaxSubcommand::Update => match self.tax_tracker.ingest(&self.rest).await {
+                    Ok(()) => info!("Successfully updated tax records"),
+                    Err(error) => error!("Failed to update tax records: {error}"),
+                },
+                TaxSubcommand::Evaluate { calendar_year } => {
+                    let TaxReport {
+                        trades: capital,
+                        dividends,
+                    } = match self.tax_tracker.tax_report(calendar_year) {
+                        Ok(report) => report,
+                        Err(error) => {
+                            error!("Failed to generate report: {error}");
+                            return;
+                        }
+                    };
+
+                    info!(
+                        "Tax-aware gains and losses for {calendar_year}:\n\
+                        Net short-term gains: {:.2} ({:.2} - {:.2})\n\
+                        Net long-term gains: {:.2} ({:.2} - {:.2})\n\
+                        Dividends: {:.2}",
+                        capital.short_term_gains - capital.short_term_losses,
+                        capital.short_term_gains,
+                        capital.short_term_losses,
+                        capital.long_term_gains - capital.long_term_losses,
+                        capital.long_term_gains,
+                        capital.long_term_losses,
+                        dividends
+                    );
+                }
+            },
             Command::UpdateHistory { max_updates } => {
                 let rest = self.rest.clone();
                 let local_history = Arc::clone(&self.local_history);
@@ -574,6 +704,43 @@ impl Engine {
         }
     }
 
+    fn list_portfolio_strategies(&self) -> anyhow::Result<()> {
+        let mut buf = Cursor::new(Vec::<u8>::with_capacity(256));
+        writeln!(buf, "Showing portfolio strategies")?;
+
+        for (key, state) in self.intraday.portfolio_manager.strategies() {
+            writeln!(buf, "{key}: {state:?}")?;
+        }
+
+        let msg = match String::from_utf8(buf.into_inner()) {
+            Ok(msg) => msg,
+            Err(error) => {
+                error!("Invalid status message encoding: {error:?}");
+                return Ok(());
+            }
+        };
+
+        info!("{msg}");
+        Ok(())
+    }
+
+    fn change_portfolio_strategy_state(&mut self, key: &str, state: StrategyState) {
+        match self
+            .intraday
+            .portfolio_manager
+            .set_strategy_state(key, state)
+        {
+            Some(old) => {
+                if old == state {
+                    info!("{key} was already {old:?}");
+                } else {
+                    info!("Set {key} to {state:?}");
+                }
+            }
+            None => info!("No portfolio strategy found with key {key}"),
+        }
+    }
+
     fn log_price_info(symbol: Symbol, price_info: &PriceInfo, level: Level) {
         log!(
             level,
@@ -659,76 +826,94 @@ impl Engine {
     }
 
     async fn handle_stream_event(&mut self, event: StreamEvent) {
-        const FIVE_MINUTES: Duration = Duration::minutes(5);
-
         match event {
             StreamEvent::MinuteBar { symbol, bar } => {
-                // if self
-                //     .clock_info
-                //     .duration_since_open
-                //     .map(|dur| dur < Duration::minutes(3))
-                //     .unwrap_or(true)
-                // {
-                //     return;
-                // }
+                self.handle_stream_minute_bar(symbol, bar).await;
+            }
+            StreamEvent::Dump { json } => self.dump_state(&json),
+        }
+    }
 
-                let avg_span = self.get_avg_span(symbol).await;
+    fn handle_stream_event_safe(&mut self, _event: StreamEvent) {
+        self.intraday.stream.send(StreamRequest::Close);
+    }
 
-                if let Some(price_info) = self
-                    .intraday
-                    .price_tracker
-                    .record_price(symbol, avg_span, bar)
-                {
-                    let threshold = avg_span * 0.225;
-                    let mut log_trace_info = false;
+    async fn handle_stream_minute_bar(&mut self, symbol: Symbol, bar: Bar) {
+        const FIVE_MINUTES: Duration = Duration::minutes(5);
 
-                    let sell_trigger = price_info.time_since_hwm >= FIVE_MINUTES
-                        && price_info.hwm_loss <= -threshold
-                        && price_info.hwm_loss > -2.0 * threshold;
-                    let buy_trigger = price_info.time_since_lwm >= FIVE_MINUTES
-                        && price_info.lwm_gain > threshold
-                        && price_info.lwm_gain < 2.0 * threshold;
+        let avg_span = self.get_avg_span(symbol).await;
 
-                    let (sell_trigger, buy_trigger) = match (sell_trigger, buy_trigger) {
-                        (true, true) => {
-                            if price_info.time_since_hwm < price_info.time_since_lwm {
-                                (true, false)
-                            } else {
-                                (false, true)
-                            }
-                        }
-                        (st, bt) => (st, bt),
-                    };
+        if let Some(price_info) = self
+            .intraday
+            .price_tracker
+            .record_price(symbol, avg_span, bar)
+        {
+            let threshold = avg_span * 0.225;
+            let mut log_trace_info = false;
 
-                    if sell_trigger {
-                        trace!("Sending sell trigger for {symbol}");
-                        log_trace_info = true;
+            let sell_trigger = price_info.time_since_hwm >= FIVE_MINUTES
+                && price_info.hwm_loss <= -threshold
+                && price_info.hwm_loss > -2.0 * threshold;
+            let buy_trigger = price_info.time_since_lwm >= FIVE_MINUTES
+                && price_info.lwm_gain > threshold
+                && price_info.lwm_gain < 2.0 * threshold;
 
-                        if let Err(error) = self.position_sell_trigger(symbol).await {
-                            error!("Failed to handle position sell trigger: {error:?}");
-                        }
-
-                        self.entry_strat_sell_trigger(symbol);
-                    }
-
-                    if buy_trigger {
-                        trace!("Sending buy trigger for {symbol}");
-                        log_trace_info = true;
-
-                        if let Err(error) = self.position_buy_trigger(symbol).await {
-                            error!("Failed to handle position buy trigger: {error:?}");
-                        }
-
-                        self.entry_strat_buy_trigger(symbol);
-                    }
-
-                    if log_trace_info {
-                        trace!(
-                            "Average span for {symbol}: {avg_span:.4}, threshold: {threshold:.4}"
-                        );
-                        Self::log_price_info(symbol, &price_info, Level::Trace);
+            let (sell_trigger, buy_trigger) = match (sell_trigger, buy_trigger) {
+                (true, true) => {
+                    if price_info.time_since_hwm < price_info.time_since_lwm {
+                        (true, false)
+                    } else {
+                        (false, true)
                     }
                 }
+                (st, bt) => (st, bt),
+            };
+
+            if sell_trigger {
+                trace!("Sending sell trigger for {symbol}");
+                log_trace_info = true;
+
+                if let Err(error) = self.position_sell_trigger(symbol).await {
+                    error!("Failed to handle position sell trigger: {error:?}");
+                }
+            }
+
+            if buy_trigger {
+                trace!("Sending buy trigger for {symbol}");
+                log_trace_info = true;
+
+                if let Err(error) = self.position_buy_trigger(symbol).await {
+                    error!("Failed to handle position buy trigger: {error:?}");
+                }
+            }
+
+            if log_trace_info {
+                trace!("Average span for {symbol}: {avg_span:.4}, threshold: {threshold:.4}");
+                Self::log_price_info(symbol, &price_info, Level::Trace);
+            }
+        }
+    }
+
+    fn dump_state(&self, stream_json: &Value) {
+        let engine_json = match serde_json::to_value(self) {
+            Ok(json) => json,
+            Err(error) => {
+                error!("Failed to dump engine state to json: {error:?}");
+                return;
+            }
+        };
+
+        let aggregate = json!({
+            "config": Config::get(),
+            "engine": engine_json,
+            "stream": stream_json
+        });
+
+        match fs::write("statedump.json", &aggregate.to_string()) {
+            Ok(()) => info!("Wrote state to statedump.json"),
+            Err(error) => {
+                error!("Failed to write JSON to file, writing to console instead. {error:?}");
+                info!("{aggregate}");
             }
         }
     }

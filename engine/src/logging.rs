@@ -162,7 +162,7 @@ impl<P: ExternalPrinter + Send + 'static> Append for CustomConsoleAppender<P> {
             Level::Warn => Color::Yellow,
             Level::Debug => Color::BrightCyan,
             Level::Trace => Color::BrightMagenta,
-            _ => Color::White,
+            _ => Color::BrightWhite,
         };
 
         write_record!(&mut writer, record, color)?;

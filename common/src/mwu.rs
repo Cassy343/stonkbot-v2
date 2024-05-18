@@ -1,16 +1,12 @@
 use rust_decimal::{Decimal, MathematicalOps};
 
-mod sealed {
-    pub trait AsReturn {
-        fn as_return(&self) -> Self;
-    }
-
-    pub trait WeightUpdate<U> {
-        fn weight_update(&self, eta: U) -> Self;
-    }
+pub trait AsReturn {
+    fn as_return(&self) -> Self;
 }
 
-pub(crate) use sealed::*;
+pub trait WeightUpdate<U> {
+    fn weight_update(&self, eta: U) -> Self;
+}
 
 pub fn mwu_multiplier<T, U>(delta: Delta<T>, eta: U) -> T
 where

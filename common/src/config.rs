@@ -1,5 +1,5 @@
 use crate::mwu::{mwu_multiplier, AsReturn, Delta, WeightUpdate};
-use crate::util::SerdeLevelFilter;
+use crate::util::{serde_black_box, SerdeLevelFilter};
 use anyhow::{anyhow, Context};
 use log::LevelFilter;
 use rust_decimal::Decimal;
@@ -26,13 +26,17 @@ const ALPACA_SECRET_KEY_ENV_VAR: &str = "ALPACA_SECRET_KEY";
 const FORCE_OPEN_ENV_VAR: &str = "FORCE_OPEN";
 const CONFIG_PATH: &str = "./config.json";
 
+#[derive(Serialize)]
 pub struct Config {
+    #[serde(serialize_with = "serde_black_box")]
     pub keys: ApiKeys,
     pub urls: Urls,
     pub trading: TradingConfig,
     pub indicator_periods: IndicatorPeriodConfig,
+    #[serde(serialize_with = "serde_black_box")]
     pub utc_offset: LocalOffset,
     pub force_open: bool,
+    #[serde(with = "SerdeLevelFilter")]
     pub log_level_filter: LevelFilter,
     extra: HashMap<String, Value>,
 }
@@ -152,6 +156,7 @@ impl Config {
     }
 }
 
+#[derive(Serialize)]
 pub struct ApiKeys {
     pub alpaca_key_id: String,
     pub alpaca_secret_key: String,
@@ -255,8 +260,10 @@ pub struct TradingConfig {
     pub seconds_per_tick: u64,
     pub minimum_median_volume: u64,
     pub minimum_cash_fraction: Decimal,
+    pub target_cash_fraction: Decimal,
     pub minimum_position_equity_fraction: Decimal,
     pub minimum_trade_equity_fraction: Decimal,
+    pub tsl_kill_threshold: Decimal,
     pub eta: Decimal,
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     pub blacklist: HashSet<Symbol>,
@@ -268,9 +275,11 @@ impl Default for TradingConfig {
             pre_open_hours_offset: 3,
             seconds_per_tick: 10,
             minimum_median_volume: 750_000,
-            minimum_cash_fraction: Decimal::new(5, 2),
+            minimum_cash_fraction: Decimal::new(1, 2),
+            target_cash_fraction: Decimal::new(25, 3),
             minimum_position_equity_fraction: Decimal::new(5, 2),
             minimum_trade_equity_fraction: Decimal::new(1, 2),
+            tsl_kill_threshold: Decimal::new(5, 1),
             eta: Decimal::ONE,
             blacklist: HashSet::new(),
         }

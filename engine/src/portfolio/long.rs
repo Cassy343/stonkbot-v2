@@ -1,4 +1,4 @@
-use std::{cell::RefCell, cmp::Reverse, collections::HashMap, rc::Rc};
+use std::cmp::Reverse;
 
 use anyhow::{anyhow, Context};
 use async_trait::async_trait;
@@ -6,158 +6,54 @@ use common::{
     config::Config,
     mwu::{mwu_multiplier, Delta},
 };
-use entity::data::SymbolMetadata;
+use entity::data::Bar;
 use history::{LocalHistory, Timeframe};
 use log::info;
+use mwu::{RollingWeightedExpert, Weighted};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use stock_symbol::Symbol;
 
-use crate::engine::{Engine, PriceInfo, PriceTracker};
+use crate::{
+    engine::{Engine, PriceTracker},
+    portfolio::mwu::WeightedExpert,
+};
 
-use super::LongPortfolioStrategy;
+use super::mwu::{self, Expert, SymbolExpert};
 
-pub fn make_long_portfolio() -> anyhow::Result<Vec<Rc<RefCell<dyn LongPortfolioStrategy>>>> {
+type Mwu = mwu::Mwu<Symbol, WeightedExpert<SymbolExpert>, Decimal>;
+type Wmwu = mwu::Mwu<Symbol, RollingWeightedExpert<SymbolExpert>, Decimal>;
+
+#[async_trait(?Send)]
+pub trait LongPortfolioStrategy: Expert<DataSource = PriceTracker> {
+    fn key(&self) -> &'static str;
+
+    // For debug purposes only
+    fn as_json_value(&self) -> Result<Value, serde_json::Error>;
+
+    fn candidates(&self) -> Vec<Symbol>;
+
+    async fn on_pre_open(&mut self, engine: &Engine) -> anyhow::Result<()>;
+}
+
+pub fn make_long_portfolio() -> anyhow::Result<Vec<Box<dyn LongPortfolioStrategy>>> {
     Ok(vec![
-        Rc::new(RefCell::new(MWUDow30::new()?)),
-        Rc::new(RefCell::new(MWUMarketTop5::new())),
-        Rc::new(RefCell::new(WMWUMarketTop5::new()?)),
+        Box::new(MwuDow30::new()?),
+        Box::new(MwuMarketTop5::new()),
+        Box::new(WmwuMarketTop5::new()?),
     ])
 }
 
-fn weights_to_fraction(symbol: Symbol, weights: &HashMap<Symbol, Decimal>) -> Decimal {
-    let phi = weights.values().sum::<Decimal>();
-    weights
-        .get(&symbol)
-        .map(|w| w / phi)
-        .unwrap_or(Decimal::ZERO)
-}
-
-#[derive(Clone, Serialize)]
-struct MWU {
-    candidates: HashMap<Symbol, MWUMeta>,
-    eta: Decimal,
-}
-
-impl MWU {
-    fn new(eta: Decimal) -> Self {
-        Self {
-            candidates: HashMap::new(),
-            eta,
-        }
-    }
-
-    fn init_candidates(&mut self, candidates: impl IntoIterator<Item = (Symbol, SymbolMetadata)>) {
-        self.candidates = candidates
-            .into_iter()
-            .map(|(symbol, meta)| (symbol, MWUMeta::from(meta)))
-            .collect();
-    }
-
-    fn latest_weights(&self, price_tracker: &PriceTracker) -> HashMap<Symbol, Decimal> {
-        let mut weights = HashMap::with_capacity(self.candidates.len());
-
-        for (&symbol, &meta) in &self.candidates {
-            let multiplier = match price_tracker.price_info(symbol) {
-                Some(PriceInfo { latest_price, .. }) => {
-                    // TODO: consider using non-volatile price?
-                    mwu_multiplier(Delta::Return(latest_price / meta.last_close), self.eta)
-                }
-                None => Decimal::ONE,
-            };
-
-            weights.insert(symbol, meta.weight * multiplier);
-        }
-
-        weights
-    }
-
-    fn optimal_equity_fraction(&self, price_tracker: &PriceTracker, symbol: Symbol) -> Decimal {
-        let weights = self.latest_weights(price_tracker);
-        weights_to_fraction(symbol, &weights)
-    }
-}
-
-#[derive(Clone, Copy, Serialize)]
-struct MWUMeta {
-    weight: Decimal,
-    last_close: Decimal,
-}
-
-impl From<SymbolMetadata> for MWUMeta {
-    fn from(meta: SymbolMetadata) -> Self {
-        Self {
-            weight: meta.performance,
-            last_close: meta.last_close,
-        }
-    }
-}
-
-#[derive(Clone, Serialize)]
-struct WMWU {
-    candidates: HashMap<Symbol, WMWUMeta>,
-    eta: Decimal,
-    lookback: usize,
-}
-
-impl WMWU {
-    fn new(eta: Decimal, lookback: usize) -> Self {
-        Self {
-            candidates: HashMap::new(),
-            eta,
-            lookback,
-        }
-    }
-
-    fn init_candidates(&mut self, candidates: impl IntoIterator<Item = (Symbol, WMWUMeta)>) {
-        self.candidates = candidates
-            .into_iter()
-            .map(|(symbol, meta)| (symbol, meta))
-            .collect();
-    }
-
-    fn latest_weights(&self, price_tracker: &PriceTracker) -> HashMap<Symbol, Decimal> {
-        let mut weights = HashMap::with_capacity(self.candidates.len());
-
-        for (&symbol, &meta) in &self.candidates {
-            let weight = match price_tracker.price_info(symbol) {
-                Some(PriceInfo { latest_price, .. }) => {
-                    // TODO: consider using non-volatile price?
-                    meta.next_weight_base
-                        * mwu_multiplier(Delta::Return(latest_price / meta.last_close), self.eta)
-                }
-                None => meta.weight,
-            };
-
-            weights.insert(symbol, weight);
-        }
-
-        weights
-    }
-
-    fn optimal_equity_fraction(&self, price_tracker: &PriceTracker, symbol: Symbol) -> Decimal {
-        let weights = self.latest_weights(price_tracker);
-        weights_to_fraction(symbol, &weights)
-    }
-}
-
-#[derive(Clone, Copy, Serialize)]
-struct WMWUMeta {
-    weight: Decimal,
-    next_weight_base: Decimal,
-    last_close: Decimal,
-}
-
-#[derive(Clone, Serialize)]
-struct MWUDow30 {
-    mwu: MWU,
+#[derive(Serialize)]
+struct MwuDow30 {
+    mwu: Mwu,
     dow30: Vec<Symbol>,
 }
 
-impl MWUDow30 {
+impl MwuDow30 {
     fn new() -> anyhow::Result<Self> {
-        let dow30 = match Config::extra::<MWUDow30Config>("longMWUDow30") {
+        let dow30 = match Config::extra::<MwuDow30Config>("longMWUDow30") {
             Ok(config) => {
                 if config.dow30.len() != 30 {
                     return Err(anyhow!("DOW 30 config must have exactly 30 symbols"));
@@ -169,28 +65,44 @@ impl MWUDow30 {
         };
 
         Ok(Self {
-            mwu: MWU::new(Config::get().trading.eta),
+            mwu: Mwu::new(Config::get().trading.eta),
             dow30,
         })
     }
 }
 
+impl Expert for MwuDow30 {
+    type DataSource = PriceTracker;
+
+    fn intraday_return(&self, price_tracker: &PriceTracker) -> Decimal {
+        self.mwu.intraday_return(price_tracker)
+    }
+
+    fn optimal_equity_fraction(&self, symbol: Symbol) -> Decimal {
+        self.mwu.optimal_equity_fraction(symbol)
+    }
+
+    fn latest_optimal_equity_fraction(
+        &self,
+        data_source: &PriceTracker,
+        symbol: Symbol,
+    ) -> Decimal {
+        self.mwu.latest_optimal_equity_fraction(data_source, symbol)
+    }
+}
+
 #[async_trait(?Send)]
-impl LongPortfolioStrategy for MWUDow30 {
+impl LongPortfolioStrategy for MwuDow30 {
     fn key(&self) -> &'static str {
         "longMWUDow30"
     }
 
     fn as_json_value(&self) -> Result<Value, serde_json::Error> {
-        serde_json::to_value(self.clone())
+        serde_json::to_value(self)
     }
 
     fn candidates(&self) -> Vec<Symbol> {
         self.dow30.clone()
-    }
-
-    fn optimal_equity_fraction(&self, price_tracker: &PriceTracker, symbol: Symbol) -> Decimal {
-        self.mwu.optimal_equity_fraction(price_tracker, symbol)
     }
 
     async fn on_pre_open(&mut self, engine: &Engine) -> anyhow::Result<()> {
@@ -202,11 +114,18 @@ impl LongPortfolioStrategy for MWUDow30 {
             .await
             .context("Failed to fetch metadata")?;
 
-        let mut candidates = Vec::with_capacity(self.dow30.len());
+        self.mwu.experts.clear();
+
         for &symbol in &self.dow30 {
             match metadata.get(&symbol) {
                 Some(&metadata) => {
-                    candidates.push((symbol, metadata));
+                    self.mwu.experts.insert(
+                        symbol,
+                        WeightedExpert::new(
+                            SymbolExpert::new(symbol, metadata.last_close),
+                            metadata.performance,
+                        ),
+                    );
                 }
                 None => {
                     return Err(anyhow!("No symbol metadata found for {symbol}"));
@@ -214,45 +133,60 @@ impl LongPortfolioStrategy for MWUDow30 {
             }
         }
 
-        self.mwu.init_candidates(candidates);
         Ok(())
     }
 }
 
 #[derive(Deserialize)]
-struct MWUDow30Config {
+struct MwuDow30Config {
     dow30: Vec<Symbol>,
 }
 
-#[derive(Clone, Serialize)]
-struct MWUMarketTop5 {
-    mwu: MWU,
+#[derive(Serialize)]
+struct MwuMarketTop5 {
+    mwu: Mwu,
 }
 
-impl MWUMarketTop5 {
+impl MwuMarketTop5 {
     fn new() -> Self {
         Self {
-            mwu: MWU::new(Config::get().trading.eta),
+            mwu: Mwu::new(Config::get().trading.eta),
         }
     }
 }
 
+impl Expert for MwuMarketTop5 {
+    type DataSource = PriceTracker;
+
+    fn intraday_return(&self, price_tracker: &PriceTracker) -> Decimal {
+        self.mwu.intraday_return(price_tracker)
+    }
+
+    fn optimal_equity_fraction(&self, symbol: Symbol) -> Decimal {
+        self.mwu.optimal_equity_fraction(symbol)
+    }
+
+    fn latest_optimal_equity_fraction(
+        &self,
+        data_source: &PriceTracker,
+        symbol: Symbol,
+    ) -> Decimal {
+        self.mwu.latest_optimal_equity_fraction(data_source, symbol)
+    }
+}
+
 #[async_trait(?Send)]
-impl LongPortfolioStrategy for MWUMarketTop5 {
+impl LongPortfolioStrategy for MwuMarketTop5 {
     fn key(&self) -> &'static str {
         "longMWUMarketTop5"
     }
 
     fn as_json_value(&self) -> Result<Value, serde_json::Error> {
-        serde_json::to_value(self.clone())
+        serde_json::to_value(self)
     }
 
     fn candidates(&self) -> Vec<Symbol> {
-        self.mwu.candidates.keys().copied().collect()
-    }
-
-    fn optimal_equity_fraction(&self, price_tracker: &PriceTracker, symbol: Symbol) -> Decimal {
-        self.mwu.optimal_equity_fraction(price_tracker, symbol)
+        self.mwu.experts.keys().copied().collect()
     }
 
     async fn on_pre_open(&mut self, engine: &Engine) -> anyhow::Result<()> {
@@ -273,46 +207,98 @@ impl LongPortfolioStrategy for MWUMarketTop5 {
 
         let mut by_performance = metadata.into_iter().collect::<Vec<_>>();
         by_performance.sort_unstable_by_key(|&(_, meta)| Reverse(meta.performance));
-        self.mwu.init_candidates(by_performance.into_iter().take(5));
+        self.mwu.experts.clear();
+        self.mwu
+            .experts
+            .extend(by_performance.into_iter().take(5).map(|(symbol, meta)| {
+                (
+                    symbol,
+                    WeightedExpert::new(
+                        SymbolExpert::new(symbol, meta.last_close),
+                        meta.performance,
+                    ),
+                )
+            }));
 
         Ok(())
     }
 }
 
-#[derive(Clone, Serialize)]
-struct WMWUMarketTop5 {
-    wmwu: WMWU,
+#[derive(Serialize)]
+struct WmwuMarketTop5 {
+    mwu: Wmwu,
+    lookback: usize,
 }
 
-impl WMWUMarketTop5 {
+impl WmwuMarketTop5 {
     fn new() -> anyhow::Result<Self> {
-        let config = match Config::extra_or_default::<WMWUMarketTop5Config>("longWMWUMarketTop5") {
+        let config = match Config::extra_or_default::<WmwuMarketTop5Config>("longWMWUMarketTop5") {
             Ok(config) => config,
             Err(error) => return Err(anyhow!("Failed to parse WMWU Market Top 5 config: {error}")),
         };
 
         Ok(Self {
-            wmwu: WMWU::new(config.eta, config.lookback),
+            mwu: Wmwu::new(config.eta),
+            lookback: config.lookback,
         })
+    }
+
+    fn compute_weight_and_base(&self, bars: &[Bar]) -> (Decimal, Decimal) {
+        let mut weight = Decimal::ONE;
+        let mut next_weight_base = Decimal::ONE;
+
+        for window in bars.windows(2).rev().take(self.lookback) {
+            let multiplier = mwu_multiplier(
+                Delta::Return(window[1].close / window[0].close),
+                self.mwu.eta,
+            );
+            next_weight_base = weight;
+            weight *= multiplier;
+        }
+
+        // Since we take windows of 2 bars at a time, we need lookback+1 bars to get a complete
+        // history. If we have less than that, then our weight base should equal our current
+        // weight, since no bars are old enough to "forget"
+        if bars.len() <= self.lookback {
+            next_weight_base = weight;
+        }
+
+        (weight, next_weight_base)
+    }
+}
+
+impl Expert for WmwuMarketTop5 {
+    type DataSource = PriceTracker;
+
+    fn intraday_return(&self, price_tracker: &PriceTracker) -> Decimal {
+        self.mwu.intraday_return(price_tracker)
+    }
+
+    fn optimal_equity_fraction(&self, symbol: Symbol) -> Decimal {
+        self.mwu.optimal_equity_fraction(symbol)
+    }
+
+    fn latest_optimal_equity_fraction(
+        &self,
+        data_source: &PriceTracker,
+        symbol: Symbol,
+    ) -> Decimal {
+        self.mwu.latest_optimal_equity_fraction(data_source, symbol)
     }
 }
 
 #[async_trait(?Send)]
-impl LongPortfolioStrategy for WMWUMarketTop5 {
+impl LongPortfolioStrategy for WmwuMarketTop5 {
     fn key(&self) -> &'static str {
         "longWMWUMarketTop5"
     }
 
     fn as_json_value(&self) -> Result<Value, serde_json::Error> {
-        serde_json::to_value(self.clone())
+        serde_json::to_value(self)
     }
 
     fn candidates(&self) -> Vec<Symbol> {
-        self.wmwu.candidates.keys().copied().collect()
-    }
-
-    fn optimal_equity_fraction(&self, price_tracker: &PriceTracker, symbol: Symbol) -> Decimal {
-        self.wmwu.optimal_equity_fraction(price_tracker, symbol)
+        self.mwu.experts.keys().copied().collect()
     }
 
     async fn on_pre_open(&mut self, engine: &Engine) -> anyhow::Result<()> {
@@ -333,57 +319,53 @@ impl LongPortfolioStrategy for WMWUMarketTop5 {
 
         let history = engine
             .local_history
-            .get_market_history(Timeframe::DaysBeforeNow(self.wmwu.lookback + 3))
+            .get_market_history(Timeframe::DaysBeforeNow(self.lookback + 3))
             .await
             .context("Failed to fetch market history")?;
 
-        let mut candidates = Vec::new();
+        let mut experts = Vec::new();
         for (symbol, meta) in metadata {
             let bars = match history.get(&symbol) {
                 Some(bars) => &**bars,
                 None => return Err(anyhow!("No local history for {symbol}")),
             };
 
-            let mut weight = Decimal::ONE;
-            let mut next_weight_base = Decimal::ONE;
+            let (weight, weight_base) = self.compute_weight_and_base(bars);
 
-            for window in bars.windows(2).rev().take(self.wmwu.lookback) {
-                let multiplier = mwu_multiplier(
-                    Delta::Return(window[1].close / window[0].close),
-                    self.wmwu.eta,
-                );
-                next_weight_base = weight;
-                weight *= multiplier;
-            }
-
-            if bars.len() <= self.wmwu.lookback {
-                next_weight_base = weight;
-            }
-
-            candidates.push((
+            experts.push((
                 symbol,
-                WMWUMeta {
+                RollingWeightedExpert::new(
+                    SymbolExpert::new(symbol, meta.last_close),
                     weight,
-                    next_weight_base,
-                    last_close: meta.last_close,
-                },
+                    weight_base,
+                ),
             ));
         }
 
-        candidates.sort_unstable_by_key(|&(_, meta)| Reverse(meta.weight));
-        self.wmwu.init_candidates(candidates.into_iter().take(5));
+        experts.sort_unstable_by_key(|(_, meta)| Reverse(meta.weight));
+        self.mwu.experts.clear();
+        self.mwu.experts.extend(experts.into_iter().take(5));
+
+        for (&symbol, expert) in &self.mwu.experts {
+            log::debug!(
+                "weight,weight_base of {symbol}: {} {}",
+                expert.weight(),
+                expert.weight_base()
+            );
+        }
+
         Ok(())
     }
 }
 
 #[derive(Deserialize)]
 #[serde(default)]
-struct WMWUMarketTop5Config {
+struct WmwuMarketTop5Config {
     eta: Decimal,
     lookback: usize,
 }
 
-impl Default for WMWUMarketTop5Config {
+impl Default for WmwuMarketTop5Config {
     fn default() -> Self {
         Self {
             eta: Config::get().trading.eta,
