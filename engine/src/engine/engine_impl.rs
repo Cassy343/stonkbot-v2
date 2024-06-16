@@ -363,7 +363,7 @@ impl Engine {
             .filter(|equity| {
                 !(equity.tradable && equity.fractionable && equity.status == AssetStatus::Active)
             })
-            .flat_map(|equity| equity.symbol.to_compact())
+            .flat_map(|equity| equity.symbol.to_symbol())
             .chain(Config::get().trading.blacklist.iter().cloned())
             .collect();
 
@@ -622,7 +622,7 @@ impl Engine {
                 let config_blacklist = &Config::get().trading.blacklist;
                 let untracked_equities = equities
                     .into_iter()
-                    .flat_map(|asset| asset.symbol.to_compact().map(|symbol| (symbol, asset)))
+                    .flat_map(|asset| asset.symbol.to_symbol().map(|symbol| (symbol, asset)))
                     .filter(|(symbol, asset)| {
                         asset.tradable
                             && asset.fractionable

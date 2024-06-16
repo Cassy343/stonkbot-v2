@@ -2,9 +2,8 @@ use std::fmt::{self, Debug, Display, Formatter};
 
 use common::util::{deserialize_date_from_str, serialize_date_as_str};
 use rust_decimal::Decimal;
-use serde::de::{self, Visitor};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use stock_symbol::Symbol;
+use serde::{Deserialize, Serialize};
+use stock_symbol::{LongSymbol, Symbol};
 use time::serde::rfc3339;
 use time::{Date, OffsetDateTime};
 use uuid::Uuid;
@@ -68,7 +67,7 @@ pub struct Equity {
     pub id: Uuid,
     pub class: AssetClass,
     pub exchange: String,
-    pub symbol: WideSymbol,
+    pub symbol: LongSymbol,
     pub status: AssetStatus,
     pub tradable: bool,
     pub marginable: bool,
@@ -278,64 +277,4 @@ pub struct SpinoffActivity {
     pub symbol: Symbol,
     pub qty: Decimal,
     pub price: Decimal,
-}
-
-#[derive(Debug, Clone)]
-pub enum WideSymbol {
-    Normal(Symbol),
-    Long(Box<str>),
-}
-
-impl WideSymbol {
-    pub fn to_compact(&self) -> Option<Symbol> {
-        match self {
-            &Self::Normal(symbol) => Some(symbol),
-            Self::Long(..) => None,
-        }
-    }
-}
-
-impl Serialize for WideSymbol {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let string = match self {
-            Self::Normal(symbol) => symbol.as_str(),
-            Self::Long(symbol) => &**symbol,
-        };
-        serializer.serialize_str(string)
-    }
-}
-
-impl<'de> Deserialize<'de> for WideSymbol {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct WideSymbolVisitor;
-
-        impl<'de> Visitor<'de> for WideSymbolVisitor {
-            type Value = WideSymbol;
-
-            fn expecting(&self, f: &mut Formatter) -> fmt::Result {
-                write!(f, "A string")
-            }
-
-            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                if v.len() < 8 {
-                    Symbol::from_str(v)
-                        .map(WideSymbol::Normal)
-                        .map_err(de::Error::custom)
-                } else {
-                    Ok(WideSymbol::Long(Box::from(v)))
-                }
-            }
-        }
-
-        deserializer.deserialize_str(WideSymbolVisitor)
-    }
 }
