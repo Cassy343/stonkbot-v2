@@ -23,6 +23,14 @@ impl PriceTracker {
         self.stocks.keys().copied()
     }
 
+    pub fn intraday_return(&self, symbol: Symbol, last_close: Decimal) -> Decimal {
+        self.stocks
+            .get(&symbol)
+            .and_then(|stock| stock.prices.last())
+            .map(|rec_price| rec_price.price / last_close)
+            .unwrap_or(Decimal::ONE)
+    }
+
     pub fn price_info(&self, symbol: Symbol) -> Option<PriceInfo> {
         self.stocks.get(&symbol).and_then(|stock| {
             stock.compute_price_info(Config::localize(OffsetDateTime::now_utc()).time())

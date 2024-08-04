@@ -1,23 +1,24 @@
+mod rate_limit;
+
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
-use std::time::Instant;
+use std::sync::Arc;
 
 use anyhow::anyhow;
 use anyhow::Context;
-use common::config::Config;
+use common::config::{ApiKeys, Config, Urls};
 use entity::trading::*;
+use rate_limit::RateLimiter;
 use reqwest::{Client, Method, RequestBuilder};
 use rust_decimal::Decimal;
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::Serialize;
-use std::time::Duration as StdDuration;
 use stock_symbol::Symbol;
 use time::format_description::well_known::Rfc3339;
 use time::Duration;
 use time::OffsetDateTime;
-use tokio::time::sleep;
 use uuid::Uuid;
 
 const KEY_ID_HEADER: &str = "APCA-API-KEY-ID";
@@ -25,16 +26,26 @@ const SECRET_KEY_HEADER: &str = "APCA-API-SECRET-KEY";
 
 #[derive(Clone)]
 pub struct AlpacaRestApi {
-    config: &'static Config,
     client: Client,
+    keys: &'static ApiKeys,
+    urls: &'static Urls,
+    rate_limiter: Arc<RateLimiter>,
 }
 
 impl AlpacaRestApi {
     pub async fn new() -> anyhow::Result<Self> {
-        let config = Config::get();
         let client = Client::new();
+        let config = Config::get();
 
-        let me = Self { config, client };
+        let me = Self {
+            client,
+            keys: &config.keys,
+            urls: &config.urls,
+            rate_limiter: Arc::new(RateLimiter::new(
+                config.request_rate_limit,
+                config.minimum_request_rate,
+            )),
+        };
 
         let account = me
             .account()
@@ -53,22 +64,20 @@ impl AlpacaRestApi {
 
     fn trading_endpoint(&self, method: Method, endpoint: &str) -> RequestBuilder {
         self.client
-            .request(
-                method,
-                format!("{}{endpoint}", self.config.urls.alpaca_api_base),
-            )
-            .header(KEY_ID_HEADER, &self.config.keys.alpaca_key_id)
-            .header(SECRET_KEY_HEADER, &self.config.keys.alpaca_secret_key)
+            .request(method, format!("{}{endpoint}", self.urls.alpaca_api_base))
+            .header(KEY_ID_HEADER, &self.keys.alpaca_key_id)
+            .header(SECRET_KEY_HEADER, &self.keys.alpaca_secret_key)
     }
 
     fn data_endpoint(&self, endpoint: &str) -> RequestBuilder {
         self.client
-            .get(format!("{}{endpoint}", self.config.urls.alpaca_data_api))
-            .header(KEY_ID_HEADER, &self.config.keys.alpaca_key_id)
-            .header(SECRET_KEY_HEADER, &self.config.keys.alpaca_secret_key)
+            .get(format!("{}{endpoint}", self.urls.alpaca_data_api))
+            .header(KEY_ID_HEADER, &self.keys.alpaca_key_id)
+            .header(SECRET_KEY_HEADER, &self.keys.alpaca_secret_key)
     }
 
-    async fn send<T: DeserializeOwned>(request: RequestBuilder) -> anyhow::Result<T> {
+    async fn send<T: DeserializeOwned>(&self, request: RequestBuilder) -> anyhow::Result<T> {
+        self.rate_limiter.throttle_request().await;
         let text = request.send().await?.text().await?;
         let res = serde_json::from_str(&text)
             .context("Failed to parse response")
@@ -80,15 +89,17 @@ impl AlpacaRestApi {
     }
 
     pub async fn account(&self) -> anyhow::Result<Account> {
-        Self::send(self.trading_endpoint(Method::GET, "/account")).await
+        self.send(self.trading_endpoint(Method::GET, "/account"))
+            .await
     }
 
     pub async fn clock(&self) -> anyhow::Result<Clock> {
-        Self::send(self.trading_endpoint(Method::GET, "/clock")).await
+        self.send(self.trading_endpoint(Method::GET, "/clock"))
+            .await
     }
 
     pub async fn us_equities(&self) -> anyhow::Result<Vec<Equity>> {
-        Self::send(
+        self.send(
             self.trading_endpoint(Method::GET, "/assets")
                 .query(&[("status", "active"), ("asset_class", "us_equity")]),
         )
@@ -96,7 +107,8 @@ impl AlpacaRestApi {
     }
 
     pub async fn positions(&self) -> anyhow::Result<Vec<Position>> {
-        Self::send(self.trading_endpoint(Method::GET, "/positions")).await
+        self.send(self.trading_endpoint(Method::GET, "/positions"))
+            .await
     }
 
     pub async fn position_map(&self) -> anyhow::Result<HashMap<Symbol, Position>> {
@@ -112,15 +124,17 @@ impl AlpacaRestApi {
     }
 
     pub async fn position(&self, symbol: Symbol) -> anyhow::Result<Position> {
-        Self::send(self.trading_endpoint(Method::GET, &format!("/positions/{symbol}"))).await
+        self.send(self.trading_endpoint(Method::GET, &format!("/positions/{symbol}")))
+            .await
     }
 
     pub async fn liquidate_position(&self, symbol: Symbol) -> anyhow::Result<Order> {
-        Self::send(self.trading_endpoint(Method::DELETE, &format!("/positions/{symbol}"))).await
+        self.send(self.trading_endpoint(Method::DELETE, &format!("/positions/{symbol}")))
+            .await
     }
 
     pub async fn sell_position(&self, symbol: Symbol, qty: Decimal) -> anyhow::Result<Order> {
-        Self::send(
+        self.send(
             self.trading_endpoint(Method::DELETE, &format!("/positions/{symbol}"))
                 .query(&[("qty", qty.round_dp(9))]),
         )
@@ -128,7 +142,7 @@ impl AlpacaRestApi {
     }
 
     pub async fn submit_order(&self, order: &OrderRequest) -> anyhow::Result<Order> {
-        Self::send(
+        self.send(
             self.trading_endpoint(Method::POST, "/orders")
                 .body(serde_json::to_string(order)?.into_bytes()),
         )
@@ -136,7 +150,7 @@ impl AlpacaRestApi {
     }
 
     pub async fn get_order(&self, id: Uuid) -> anyhow::Result<Order> {
-        Self::send(self.trading_endpoint(Method::GET, &format!("/orders/{}", id.hyphenated())))
+        self.send(self.trading_endpoint(Method::GET, &format!("/orders/{}", id.hyphenated())))
             .await
     }
 
@@ -146,7 +160,7 @@ impl AlpacaRestApi {
         limit: usize,
         after: OffsetDateTime,
     ) -> anyhow::Result<Vec<Order>> {
-        Self::send(self.trading_endpoint(Method::GET, "/orders").query(&(
+        self.send(self.trading_endpoint(Method::GET, "/orders").query(&(
             ("status", status),
             ("limit", limit),
             ("after", after.format(&Rfc3339)?),
@@ -159,7 +173,7 @@ impl AlpacaRestApi {
         &self,
         activity_type: &str,
     ) -> anyhow::Result<Vec<A>> {
-        Self::send(
+        self.send(
             self.trading_endpoint(Method::GET, "/account/activities")
                 .query(&[("activity_types", activity_type)]),
         )
@@ -173,16 +187,17 @@ impl AlpacaRestApi {
     ) -> Result<Option<B>, anyhow::Error> {
         let start_date = date.format(&Rfc3339)?;
         let end_date = (date + Duration::days(1)).format(&Rfc3339)?;
-        let mut response = Self::send::<AlpacaBarsResponse<B>>(
-            self.data_endpoint(&format!("/stocks/{}/bars", stock))
-                .query(&[
-                    ("start", start_date.as_str()),
-                    ("end", &end_date),
-                    ("limit", "1"),
-                    ("timeframe", "1Day"),
-                ]),
-        )
-        .await?;
+        let mut response = self
+            .send::<AlpacaBarsResponse<B>>(
+                self.data_endpoint(&format!("/stocks/{}/bars", stock))
+                    .query(&[
+                        ("start", start_date.as_str()),
+                        ("end", &end_date),
+                        ("limit", "1"),
+                        ("timeframe", "1Day"),
+                    ]),
+            )
+            .await?;
 
         match response.bars.len() {
             0 => Ok(None),
@@ -241,8 +256,7 @@ impl AlpacaRestApi {
                 request
             };
 
-            let request_sent_at = Instant::now();
-            let response: History<B> = Self::send(request).await?;
+            let response: History<B> = self.send(request).await?;
 
             for (symbol, bars) in response.bars {
                 match agg_history.entry(symbol) {
@@ -256,9 +270,6 @@ impl AlpacaRestApi {
             next_page_token = response.next_page_token;
             if next_page_token.is_none() {
                 break;
-            } else {
-                let elapsed = request_sent_at.elapsed();
-                sleep(StdDuration::from_millis(400).saturating_sub(elapsed)).await;
             }
         }
 

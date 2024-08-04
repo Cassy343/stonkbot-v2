@@ -129,8 +129,18 @@ impl PortfolioManager {
             }
         }
 
-        self.long.experts.keys().for_each(|&key| {
-            returns.entry(key).or_insert(Decimal::ONE);
+        self.long.experts.iter().for_each(|(&key, strategy)| {
+            returns
+                .entry(key)
+                .and_modify(|r| {
+                    if matches!(
+                        strategy.get_state(),
+                        StrategyState::Disabled | StrategyState::Liquidated
+                    ) {
+                        *r = Decimal::ONE;
+                    }
+                })
+                .or_insert(Decimal::ONE);
         });
 
         returns

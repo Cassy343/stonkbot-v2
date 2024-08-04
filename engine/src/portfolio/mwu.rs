@@ -5,7 +5,7 @@ use rust_decimal::Decimal;
 use serde::Serialize;
 use stock_symbol::Symbol;
 
-use crate::engine::{PriceInfo, PriceTracker};
+use crate::engine::PriceTracker;
 
 pub trait Expert {
     type DataSource;
@@ -23,12 +23,12 @@ pub trait Expert {
 
 #[derive(Serialize)]
 pub struct SymbolExpert {
-    symbol: Symbol,
-    last_close: Decimal,
+    pub symbol: Symbol,
+    pub last_close: Option<Decimal>,
 }
 
 impl SymbolExpert {
-    pub fn new(symbol: Symbol, last_close: Decimal) -> Self {
+    pub fn new(symbol: Symbol, last_close: Option<Decimal>) -> Self {
         Self { symbol, last_close }
     }
 }
@@ -37,10 +37,9 @@ impl Expert for SymbolExpert {
     type DataSource = PriceTracker;
 
     fn intraday_return(&self, data_source: &Self::DataSource) -> Decimal {
-        match data_source.price_info(self.symbol) {
-            Some(PriceInfo { latest_price, .. }) => latest_price / self.last_close,
-            None => Decimal::ONE,
-        }
+        self.last_close
+            .map(|last_close| data_source.intraday_return(self.symbol, last_close))
+            .unwrap_or(Decimal::ONE)
     }
 
     fn optimal_equity_fraction(&self, symbol: Symbol) -> Decimal {

@@ -38,11 +38,23 @@ pub trait LongPortfolioStrategy: Expert<DataSource = PriceTracker> {
 }
 
 pub fn make_long_portfolio() -> anyhow::Result<Vec<Box<dyn LongPortfolioStrategy>>> {
-    Ok(vec![
+    let mut strategies: Vec<Box<dyn LongPortfolioStrategy>> = vec![
         Box::new(MwuDow30::new()?),
         Box::new(MwuMarketTop5::new()),
         Box::new(WmwuMarketTop5::new()?),
-    ])
+    ];
+
+    // SES = Single Equity Strateg(y|ies)
+    strategies.extend(
+        Config::extra_or_default::<Vec<Symbol>>("ses")
+            .context("ses must be a list of symbols")?
+            .into_iter()
+            .map(|symbol| {
+                Box::new(SingleEquityStrategy::new(symbol)) as Box<dyn LongPortfolioStrategy>
+            }),
+    );
+
+    Ok(strategies)
 }
 
 #[derive(Serialize)]
@@ -122,7 +134,7 @@ impl LongPortfolioStrategy for MwuDow30 {
                     self.mwu.experts.insert(
                         symbol,
                         WeightedExpert::new(
-                            SymbolExpert::new(symbol, metadata.last_close),
+                            SymbolExpert::new(symbol, Some(metadata.last_close)),
                             metadata.performance,
                         ),
                     );
@@ -214,7 +226,7 @@ impl LongPortfolioStrategy for MwuMarketTop5 {
                 (
                     symbol,
                     WeightedExpert::new(
-                        SymbolExpert::new(symbol, meta.last_close),
+                        SymbolExpert::new(symbol, Some(meta.last_close)),
                         meta.performance,
                     ),
                 )
@@ -319,7 +331,7 @@ impl LongPortfolioStrategy for WmwuMarketTop5 {
 
         let history = engine
             .local_history
-            .get_market_history(Timeframe::DaysBeforeNow(self.lookback + 3))
+            .get_market_history(Timeframe::DaysBeforeNow(self.lookback + 4))
             .await
             .context("Failed to fetch market history")?;
 
@@ -335,7 +347,7 @@ impl LongPortfolioStrategy for WmwuMarketTop5 {
             experts.push((
                 symbol,
                 RollingWeightedExpert::new(
-                    SymbolExpert::new(symbol, meta.last_close),
+                    SymbolExpert::new(symbol, Some(meta.last_close)),
                     weight,
                     weight_base,
                 ),
@@ -371,5 +383,77 @@ impl Default for WmwuMarketTop5Config {
             eta: Config::get().trading.eta,
             lookback: 300,
         }
+    }
+}
+
+#[derive(Serialize)]
+struct SingleEquityStrategy {
+    key: &'static str,
+    expert: SymbolExpert,
+}
+
+impl SingleEquityStrategy {
+    fn new(symbol: Symbol) -> Self {
+        let key: &'static str = String::leak(format!("longSES_{symbol}"));
+        Self {
+            key,
+            expert: SymbolExpert::new(symbol, None),
+        }
+    }
+}
+
+impl Expert for SingleEquityStrategy {
+    type DataSource = PriceTracker;
+
+    fn intraday_return(&self, data_source: &Self::DataSource) -> Decimal {
+        self.expert.intraday_return(data_source)
+    }
+
+    fn optimal_equity_fraction(&self, symbol: Symbol) -> Decimal {
+        self.expert.optimal_equity_fraction(symbol)
+    }
+
+    fn latest_optimal_equity_fraction(
+        &self,
+        data_source: &Self::DataSource,
+        symbol: Symbol,
+    ) -> Decimal {
+        self.expert
+            .latest_optimal_equity_fraction(data_source, symbol)
+    }
+}
+
+#[async_trait(?Send)]
+impl LongPortfolioStrategy for SingleEquityStrategy {
+    fn key(&self) -> &'static str {
+        self.key
+    }
+
+    fn as_json_value(&self) -> Result<Value, serde_json::Error> {
+        serde_json::to_value(self)
+    }
+
+    fn candidates(&self) -> Vec<Symbol> {
+        vec![self.expert.symbol]
+    }
+
+    async fn on_pre_open(&mut self, engine: &Engine) -> anyhow::Result<()> {
+        let symbol = self.expert.symbol;
+        info!("Initializing SES for {symbol}");
+
+        let meta = engine
+            .local_history
+            .get_metadata()
+            .await
+            .context("Failed to fetch metadata")?;
+
+        let last_close = match meta.get(&symbol) {
+            Some(symbol_meta) => Some(symbol_meta.last_close),
+            None => return Err(anyhow!("No symbol metadata found for {symbol}")),
+        };
+
+        log::debug!("Got last close of {last_close:?} for {symbol}");
+        self.expert.last_close = last_close;
+        Ok(())
     }
 }

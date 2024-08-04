@@ -6,4 +6,4 @@ mod tax;
 mod trailing;
 
 pub use engine_impl::{run, Engine};
-pub use trailing::{PriceInfo, PriceTracker};
+pub use trailing::PriceTracker;

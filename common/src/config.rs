@@ -38,6 +38,8 @@ pub struct Config {
     pub force_open: bool,
     #[serde(with = "SerdeLevelFilter")]
     pub log_level_filter: LevelFilter,
+    pub request_rate_limit: usize,
+    pub minimum_request_rate: usize,
     extra: HashMap<String, Value>,
 }
 
@@ -103,6 +105,18 @@ impl Config {
             None => false,
         };
 
+        if on_disk_config.request_rate_limit == 0 || on_disk_config.minimum_request_rate == 0 {
+            return Err(anyhow!(
+                "Request rate limit and minimum request rate must be positive"
+            ));
+        }
+
+        if on_disk_config.minimum_request_rate > on_disk_config.request_rate_limit {
+            return Err(anyhow!(
+                "Minimum request rate must be less than or equal to the rate limit"
+            ));
+        }
+
         let me = Self {
             keys,
             urls: on_disk_config.urls,
@@ -111,6 +125,8 @@ impl Config {
             utc_offset,
             force_open,
             log_level_filter: on_disk_config.log_level_filter,
+            request_rate_limit: on_disk_config.request_rate_limit,
+            minimum_request_rate: on_disk_config.minimum_request_rate,
             extra: on_disk_config.extra,
         };
 
@@ -338,6 +354,8 @@ struct OnDiskConfig {
     utc_offset: Option<LocalOffset>,
     #[serde(with = "SerdeLevelFilter")]
     log_level_filter: LevelFilter,
+    request_rate_limit: usize,
+    minimum_request_rate: usize,
     #[serde(flatten)]
     extra: HashMap<String, Value>,
 }
@@ -360,6 +378,8 @@ impl Default for OnDiskConfig {
             indicator_periods: IndicatorPeriodConfig::default(),
             utc_offset: None,
             log_level_filter: LevelFilter::Trace,
+            request_rate_limit: 200,
+            minimum_request_rate: 120,
             extra: HashMap::new(),
         }
     }
